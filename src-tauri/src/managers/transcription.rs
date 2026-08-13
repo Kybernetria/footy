@@ -29,6 +29,13 @@ enum LoadedEngine {
     Parakeet(ParakeetModel),
 }
 
+fn lock_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        warn!("Recovering poisoned {} mutex", name);
+        poisoned.into_inner()
+    })
+}
+
 /// RAII guard that clears the `is_loading` flag and notifies waiters on drop.
 /// Ensures the loading flag is always reset, even on early returns or panics.
 pub struct LoadingGuard {
@@ -38,7 +45,7 @@ pub struct LoadingGuard {
 
 impl Drop for LoadingGuard {
     fn drop(&mut self) {
-        let mut is_loading = self.is_loading.lock().unwrap();
+        let mut is_loading = lock_recover(&self.is_loading, "model loading state");
         *is_loading = false;
         self.loading_condvar.notify_all();
     }
@@ -55,6 +62,10 @@ pub struct TranscriptionManager {
     watcher_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     is_loading: Arc<Mutex<bool>>,
     loading_condvar: Arc<Condvar>,
+    // Serializes model replacement, unloading, and inference. The engine is
+    // temporarily moved out during inference, so this gate covers the whole
+    // call and prevents a switch from restoring an older engine afterward.
+    model_operation_lock: Arc<Mutex<()>>,
 }
 
 impl TranscriptionManager {
@@ -69,6 +80,7 @@ impl TranscriptionManager {
             watcher_handle: Arc::new(Mutex::new(None)),
             is_loading: Arc::new(Mutex::new(false)),
             loading_condvar: Arc::new(Condvar::new()),
+            model_operation_lock: Arc::new(Mutex::new(())),
         };
 
         // Start the idle watcher
@@ -174,7 +186,7 @@ impl TranscriptionManager {
     /// clear the flag and wake waiters. Returns `None` if a load is already in
     /// progress.
     pub fn try_start_loading(&self) -> Option<LoadingGuard> {
-        let mut is_loading = self.is_loading.lock().unwrap();
+        let mut is_loading = lock_recover(&self.is_loading, "model loading state");
         if *is_loading {
             return None;
         }
@@ -186,36 +198,62 @@ impl TranscriptionManager {
     }
 
     pub fn unload_model(&self) -> Result<()> {
+        self.with_model_unloaded(|| Ok(()))
+    }
+
+    /// Temporarily removes the loaded engine while running a fallible model
+    /// lifecycle operation. If the operation fails, the exact engine and
+    /// current-model state are restored. This is required on platforms where
+    /// an open model file cannot be renamed into deletion quarantine.
+    pub fn with_model_unloaded<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _operation_guard = lock_recover(&self.model_operation_lock, "model operation");
         let unload_start = std::time::Instant::now();
-        debug!("Starting to unload model");
+        debug!("Starting transactional model unload");
 
-        {
+        let previous_engine = {
             let mut engine = self.lock_engine();
-            // Dropping the engine frees all resources
-            *engine = None;
-        }
-        {
-            let mut current_model = self.current_model_id.lock().unwrap();
-            *current_model = None;
-        }
+            engine.take()
+        };
+        let previous_model = {
+            let mut current_model = lock_recover(&self.current_model_id, "current model");
+            current_model.take()
+        };
 
-        // Emit unloaded event
-        let _ = self.app_handle.emit(
-            "model-state-changed",
-            ModelStateEvent {
-                event_type: "unloaded".to_string(),
-                model_id: None,
-                model_name: None,
-                error: None,
-            },
-        );
+        let restore = |manager: &Self| {
+            let mut engine = manager.lock_engine();
+            *engine = previous_engine;
+            drop(engine);
+            let mut current_model = lock_recover(&manager.current_model_id, "current model");
+            *current_model = previous_model;
+        };
 
-        let unload_duration = unload_start.elapsed();
-        debug!(
-            "Model unloaded manually (took {}ms)",
-            unload_duration.as_millis()
-        );
-        Ok(())
+        let operation_result = catch_unwind(AssertUnwindSafe(operation));
+        match operation_result {
+            Ok(Ok(value)) => {
+                let _ = self.app_handle.emit(
+                    "model-state-changed",
+                    ModelStateEvent {
+                        event_type: "unloaded".to_string(),
+                        model_id: None,
+                        model_name: None,
+                        error: None,
+                    },
+                );
+                debug!(
+                    "Model unloaded transactionally (took {}ms)",
+                    unload_start.elapsed().as_millis()
+                );
+                Ok(value)
+            }
+            Ok(Err(error)) => {
+                restore(self);
+                Err(error)
+            }
+            Err(panic_payload) => {
+                restore(self);
+                std::panic::resume_unwind(panic_payload);
+            }
+        }
     }
 
     fn now_ms() -> u64 {
@@ -244,6 +282,11 @@ impl TranscriptionManager {
     }
 
     pub fn load_model(&self, model_id: &str) -> Result<()> {
+        let _operation_guard = lock_recover(&self.model_operation_lock, "model operation");
+        self.load_model_unlocked(model_id)
+    }
+
+    fn load_model_unlocked(&self, model_id: &str) -> Result<()> {
         let load_start = std::time::Instant::now();
         debug!("Starting to load model: {}", model_id);
 
@@ -307,7 +350,7 @@ impl TranscriptionManager {
             *engine = Some(loaded_engine);
         }
         {
-            let mut current_model = self.current_model_id.lock().unwrap();
+            let mut current_model = lock_recover(&self.current_model_id, "current model");
             *current_model = Some(model_id.to_string());
         }
 
@@ -428,7 +471,7 @@ impl TranscriptionManager {
     }
 
     pub fn get_current_model(&self) -> Option<String> {
-        let current_model = self.current_model_id.lock().unwrap();
+        let current_model = lock_recover(&self.current_model_id, "current model");
         current_model.clone()
     }
 
@@ -458,8 +501,18 @@ impl TranscriptionManager {
         // start a background preload first.
         self.ensure_model_loaded()?;
 
-        // Get current settings for configuration
+        // Keep model selection, engine ownership, and inference in one
+        // critical section. A model switch may update settings while waiting,
+        // but it cannot replace the engine until this inference has restored
+        // or dropped it.
+        let operation_guard = lock_recover(&self.model_operation_lock, "model operation");
         let settings = get_settings(&self.app_handle);
+        if !self.is_model_loaded_for(&settings.selected_model) {
+            drop(operation_guard);
+            return Err(anyhow::anyhow!(
+                "The selected transcription model changed while preparing inference. Please retry."
+            ));
+        }
 
         // Perform transcription with the appropriate engine.
         // Parakeet handles language internally via its built-in model.
@@ -549,6 +602,7 @@ impl TranscriptionManager {
                 }
             }
         };
+        drop(operation_guard);
 
         // Apply word correction if custom words are configured
         let corrected_result = if !settings.custom_words.is_empty() {
@@ -629,6 +683,22 @@ pub fn get_available_accelerators() -> AvailableAccelerators {
         .collect();
 
     AvailableAccelerators { ort: ort_options }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_model_operation_mutex_is_recoverable() {
+        let mutex = Mutex::new(());
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("simulated model loader panic");
+        }));
+        assert!(result.is_err());
+        let _guard = lock_recover(&mutex, "test model operation");
+    }
 }
 
 impl Drop for TranscriptionManager {

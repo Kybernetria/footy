@@ -2,6 +2,7 @@ import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 import { locale } from "@tauri-apps/plugin-os";
 import { LANGUAGE_METADATA } from "./languages";
+import localeFallbacks from "./fallbacks.json";
 import { commands } from "@/bindings";
 import {
   getLanguageDirection,
@@ -71,12 +72,12 @@ const getSupportedLanguage = (
   return supported ? supported.code : null;
 };
 
-// Initialize i18n with English as default
-// Language will be synced from settings after init
+// Initialize i18n with an explicit default fallback. Locale files may omit
+// untranslated keys; i18next resolves those keys from this language.
 i18n.use(initReactI18next).init({
   resources,
-  lng: "en",
-  fallbackLng: "en",
+  lng: localeFallbacks.default,
+  fallbackLng: localeFallbacks.default,
   interpolation: {
     escapeValue: false, // React already escapes values
   },

@@ -6,7 +6,31 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Configuration
 const LOCALES_DIR = path.join(__dirname, "..", "src", "i18n", "locales");
-const REFERENCE_LANG = "en";
+const FALLBACK_CONFIG_PATH = path.join(
+  __dirname,
+  "..",
+  "src",
+  "i18n",
+  "fallbacks.json",
+);
+
+interface FallbackConfig {
+  default: string;
+}
+
+let fallbackConfig: FallbackConfig;
+try {
+  fallbackConfig = JSON.parse(
+    fs.readFileSync(FALLBACK_CONFIG_PATH, "utf8"),
+  ) as FallbackConfig;
+} catch (error) {
+  console.error(
+    `Failed to load locale fallback config: ${(error as Error).message}`,
+  );
+  process.exit(1);
+}
+
+const REFERENCE_LANG = fallbackConfig.default;
 
 type TranslationData = Record<string, unknown>;
 
@@ -132,13 +156,16 @@ function validateTranslations(): void {
       (keyPath) => !hasKeyPath(referenceData, keyPath),
     );
 
+    // Missing keys are intentional: i18next falls back structurally to the
+    // configured reference language. Extra keys remain errors so locale files
+    // cannot silently diverge from the reference contract.
     results[lang] = {
-      valid: missing.length === 0 && extra.length === 0,
+      valid: extra.length === 0,
       missing,
       extra,
     };
 
-    if (missing.length > 0 || extra.length > 0) {
+    if (extra.length > 0) {
       hasErrors = true;
     }
   }
@@ -151,15 +178,22 @@ function validateTranslations(): void {
     const result = results[lang];
 
     if (result.valid) {
+      const fallbackNote =
+        result.missing.length === 0
+          ? "All keys present"
+          : `${result.missing.length} keys use fallback ${REFERENCE_LANG}`;
       console.log(
-        colorize(`✓ ${lang.toUpperCase()}: All keys present`, "green"),
+        colorize(`✓ ${lang.toUpperCase()}: ${fallbackNote}`, "green"),
       );
     } else {
       console.log(colorize(`✗ ${lang.toUpperCase()}: Issues found`, "red"));
 
       if (result.missing.length > 0) {
         console.log(
-          colorize(`  Missing ${result.missing.length} keys:`, "yellow"),
+          colorize(
+            `  Missing ${result.missing.length} keys (fallback to ${REFERENCE_LANG}):`,
+            "yellow",
+          ),
         );
         result.missing.slice(0, 10).forEach((keyPath) => {
           console.log(`    - ${keyPath.join(".")}`);
@@ -212,7 +246,7 @@ function validateTranslations(): void {
   } else {
     console.log(
       colorize(
-        `\n✓ All ${totalCount} languages have complete translations!`,
+        `\n✓ All ${totalCount} locale structures are valid; missing keys use ${REFERENCE_LANG} fallback.`,
         "green",
       ),
     );
