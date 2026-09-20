@@ -12,6 +12,16 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 #[cfg(target_os = "linux")]
 use crate::utils::{is_kde_wayland, is_wayland};
 
+fn finish_clipboard_paste(
+    paste_result: Result<(), String>,
+    restore_delay_ms: u64,
+    restore_clipboard: impl FnOnce(),
+) -> Result<(), String> {
+    std::thread::sleep(Duration::from_millis(restore_delay_ms));
+    restore_clipboard();
+    paste_result
+}
+
 /// Pastes text using the clipboard: saves current content, writes text, sends paste keystroke, restores clipboard.
 fn paste_via_clipboard(
     enigo: &mut Enigo,
@@ -21,7 +31,15 @@ fn paste_via_clipboard(
     paste_delay_ms: u64,
 ) -> Result<(), String> {
     let clipboard = app_handle.clipboard();
-    let clipboard_content = clipboard.read_text().unwrap_or_default();
+    let saved_text = clipboard.read_text().ok();
+    let saved_image = if saved_text
+        .as_deref()
+        .map_or(true, |saved_text| saved_text.is_empty())
+    {
+        clipboard.read_image().ok().map(|image| image.to_owned())
+    } else {
+        None
+    };
 
     // Write text to clipboard first
     // On Wayland, prefer wl-copy for better compatibility (especially with umlauts)
@@ -44,38 +62,63 @@ fn paste_via_clipboard(
 
     std::thread::sleep(Duration::from_millis(paste_delay_ms));
 
-    // Send paste key combo
-    #[cfg(target_os = "linux")]
-    let key_combo_sent = try_send_key_combo_linux(paste_method)?;
+    // Capture key injection errors so the original clipboard is restored before
+    // propagating them to the caller.
+    let paste_result = (|| -> Result<(), String> {
+        // Send paste key combo
+        #[cfg(target_os = "linux")]
+        let key_combo_sent = try_send_key_combo_linux(paste_method)?;
 
-    #[cfg(not(target_os = "linux"))]
-    let key_combo_sent = false;
+        #[cfg(not(target_os = "linux"))]
+        let key_combo_sent = false;
 
-    // Fall back to enigo if no native tool handled it
-    if !key_combo_sent {
-        match paste_method {
-            PasteMethod::CtrlV => input::send_paste_ctrl_v(enigo)?,
-            PasteMethod::CtrlShiftV => input::send_paste_ctrl_shift_v(enigo)?,
-            PasteMethod::ShiftInsert => input::send_paste_shift_insert(enigo)?,
-            _ => return Err("Invalid paste method for clipboard paste".into()),
+        // Fall back to enigo if no native tool handled it
+        if !key_combo_sent {
+            match paste_method {
+                PasteMethod::CtrlV => input::send_paste_ctrl_v(enigo)?,
+                PasteMethod::CtrlShiftV => input::send_paste_ctrl_shift_v(enigo)?,
+                PasteMethod::ShiftInsert => input::send_paste_shift_insert(enigo)?,
+                _ => return Err("Invalid paste method for clipboard paste".into()),
+            }
         }
-    }
 
-    std::thread::sleep(std::time::Duration::from_millis(50));
+        Ok(())
+    })();
 
-    // Restore original clipboard content
-    // On Wayland, prefer wl-copy for better compatibility
-    #[cfg(target_os = "linux")]
-    if is_wayland() && is_wl_copy_available() {
-        let _ = write_clipboard_via_wl_copy(&clipboard_content);
-    } else {
-        let _ = clipboard.write_text(&clipboard_content);
-    }
+    finish_clipboard_paste(paste_result, 50, || {
+        // Restore original clipboard content even when key injection failed.
+        // If neither read succeeded, the clipboard may have been empty or
+        // contained an unsupported format. We cannot restore that snapshot;
+        // leave the transcription available rather than blindly clearing it.
+        if let Some(saved_text) = saved_text
+            .as_deref()
+            .filter(|saved_text| !saved_text.is_empty())
+        {
+            #[cfg(target_os = "linux")]
+            if is_wayland() && is_wl_copy_available() {
+                let _ = write_clipboard_via_wl_copy(saved_text);
+            } else {
+                let _ = clipboard.write_text(saved_text);
+            }
 
-    #[cfg(not(target_os = "linux"))]
-    let _ = clipboard.write_text(&clipboard_content);
+            #[cfg(not(target_os = "linux"))]
+            let _ = clipboard.write_text(saved_text);
+        } else if let Some(saved_image) = saved_image {
+            let _ = clipboard.write_image(&saved_image);
+        } else if saved_text.is_some() {
+            // An empty string was successfully captured, so restoring it is
+            // safe and preserves an empty/text clipboard without using clear().
+            #[cfg(target_os = "linux")]
+            if is_wayland() && is_wl_copy_available() {
+                let _ = write_clipboard_via_wl_copy("");
+            } else {
+                let _ = clipboard.write_text("");
+            }
 
-    Ok(())
+            #[cfg(not(target_os = "linux"))]
+            let _ = clipboard.write_text("");
+        }
+    })
 }
 
 /// Attempts to send a key combination using Linux-native tools.
@@ -683,5 +726,27 @@ mod tests {
         assert!(should_send_auto_submit(true, PasteMethod::Direct));
         assert!(should_send_auto_submit(true, PasteMethod::CtrlShiftV));
         assert!(should_send_auto_submit(true, PasteMethod::ShiftInsert));
+    }
+
+    #[test]
+    fn clipboard_is_restored_before_key_injection_error_is_returned() {
+        let restored = std::cell::Cell::new(false);
+        let result = finish_clipboard_paste(Err("input failed".into()), 0, || {
+            restored.set(true);
+        });
+
+        assert_eq!(result.unwrap_err(), "input failed");
+        assert!(restored.get());
+    }
+
+    #[test]
+    fn clipboard_is_restored_after_successful_paste() {
+        let restored = std::cell::Cell::new(false);
+        let result = finish_clipboard_paste(Ok(()), 0, || {
+            restored.set(true);
+        });
+
+        assert!(result.is_ok());
+        assert!(restored.get());
     }
 }

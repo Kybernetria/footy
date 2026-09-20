@@ -401,6 +401,7 @@ export const HistorySettings: React.FC = () => {
   };
 
   const handleImport = async () => {
+    let importStarted = false;
     try {
       const selected = await open({
         multiple: false,
@@ -425,6 +426,11 @@ export const HistorySettings: React.FC = () => {
         return;
       }
 
+      importStarted = true;
+      if (importResetTimeoutRef.current) {
+        clearTimeout(importResetTimeoutRef.current);
+        importResetTimeoutRef.current = null;
+      }
       setIsImporting(true);
       setImportProgress(null);
       toast.info(t("settings.history.importing"));
@@ -435,20 +441,29 @@ export const HistorySettings: React.FC = () => {
         return;
       }
 
-      setIsImporting(false);
-      setImportProgress(null);
-      toast.error(`${t("settings.history.importFailed")}: ${result.error}`);
+      if (!isImportCancelledError(result.error)) {
+        toast.error(`${t("settings.history.importFailed")}: ${result.error}`);
+      }
     } catch (error) {
       if (isImportCancelledError(error)) {
         return;
       }
 
       console.error("Failed to import audio:", error);
-      setIsImporting(false);
-      setImportProgress(null);
       toast.error(
         `${t("settings.history.importFailed")}: ${getErrorMessage(error)}`,
       );
+    } finally {
+      // The command completing is authoritative, even if a terminal progress
+      // event was missed. Cancelling the file picker must not reset another import.
+      if (importStarted) {
+        if (importResetTimeoutRef.current) {
+          clearTimeout(importResetTimeoutRef.current);
+          importResetTimeoutRef.current = null;
+        }
+        setIsImporting(false);
+        setImportProgress(null);
+      }
     }
   };
 

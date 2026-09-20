@@ -11,12 +11,24 @@ import { useSettings } from "../../hooks/useSettings";
 import { useOsType } from "../../hooks/useOsType";
 import { commands } from "@/bindings";
 import { toast } from "sonner";
+import {
+  runGlobalShortcutBindingOperation,
+  type BindingOperationSummary,
+} from "./globalShortcutLifecycle";
 
 interface GlobalShortcutInputProps {
   descriptionMode?: "inline" | "tooltip";
   grouped?: boolean;
   shortcutId: string;
   disabled?: boolean;
+}
+
+interface RecordingSession {
+  id: string;
+  originalBinding: string;
+  bindingIds: string[];
+  suspendPromise: Promise<BindingOperationSummary>;
+  finalizePromise?: Promise<void>;
 }
 
 export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
@@ -33,21 +45,151 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
   const [editingShortcutId, setEditingShortcutId] = useState<string | null>(
     null,
   );
-  const [originalBinding, setOriginalBinding] = useState<string>("");
   const shortcutRefs = useRef<Map<string, HTMLDivElement | null>>(new Map());
   const osType = useOsType();
 
   const bindings = getSetting("bindings") || {};
+  const postProcessEnabled = getSetting("post_process_enabled") ?? false;
+  const relevantBindingIds = Object.keys(bindings).filter(
+    (id) =>
+      id !== "cancel" &&
+      (id !== "transcribe_with_post_process" || postProcessEnabled),
+  );
+  const mountedRef = useRef(true);
+  const recordingSessionRef = useRef<RecordingSession | null>(null);
+  const updateBindingRef = useRef(updateBinding);
+  const translationRef = useRef(t);
+  updateBindingRef.current = updateBinding;
+  translationRef.current = t;
+
+  const suspendBindings = (ids: string[]): Promise<BindingOperationSummary> =>
+    runGlobalShortcutBindingOperation(ids, (id) => commands.suspendBinding(id));
+
+  const resumeBindings = (ids: string[]): Promise<BindingOperationSummary> =>
+    runGlobalShortcutBindingOperation(ids, (id) => commands.resumeBinding(id));
+
+  const reportBindingErrors = (
+    action: "suspend" | "resume",
+    errors: BindingOperationSummary["errors"],
+  ) => {
+    errors.forEach(({ id, error }) => {
+      const message = `Failed to ${action} shortcut '${id}': ${String(error)}`;
+      console.error(message);
+      toast.error(message);
+    });
+  };
+
+  const finishRecording = (
+    session: RecordingSession,
+    newBinding?: string,
+  ): Promise<void> => {
+    // A keyup, click, and unmount can race each other. The first finalizer
+    // owns the session; all later callers wait for the same cleanup.
+    if (session.finalizePromise) return session.finalizePromise;
+
+    session.finalizePromise = (async () => {
+      const suspendResult = await session.suspendPromise;
+      reportBindingErrors("suspend", suspendResult.errors);
+      // Restore other shortcuts before changing this one, so backend duplicate
+      // detection still prevents stealing another action's key combination.
+      const otherResumeResult = await resumeBindings(
+        suspendResult.successfulIds.filter((id) => id !== session.id),
+      );
+      reportBindingErrors("resume", otherResumeResult.errors);
+      const canUpdate =
+        suspendResult.errors.length === 0 &&
+        otherResumeResult.errors.length === 0;
+      let bindingUpdated = false;
+      let bindingRegistered = false;
+
+      if (canUpdate && newBinding !== undefined) {
+        try {
+          await updateBindingRef.current(session.id, newBinding);
+          bindingUpdated = true;
+          bindingRegistered = true;
+        } catch (error) {
+          console.error("Failed to change binding:", error);
+          toast.error(
+            translationRef.current("settings.general.shortcut.errors.set", {
+              error: String(error),
+            }),
+          );
+        }
+      }
+
+      // Only a failed update needs the original value restored. Cancellation
+      // before an update does not change the binding.
+      if (
+        canUpdate &&
+        newBinding !== undefined &&
+        !bindingUpdated &&
+        session.originalBinding
+      ) {
+        try {
+          await updateBindingRef.current(session.id, session.originalBinding);
+          bindingRegistered = true;
+        } catch (error) {
+          console.error("Failed to restore original binding:", error);
+          toast.error(
+            translationRef.current("settings.general.shortcut.errors.reset"),
+          );
+        }
+      }
+
+      // changeBinding registers the edited shortcut itself. Registering it
+      // again can fail as a duplicate on the Tauri shortcut backend.
+      const resumeResult = await resumeBindings([
+        ...suspendResult.successfulIds.filter(
+          (id) => id === session.id && !bindingRegistered,
+        ),
+        // A transient backend failure must not strand another action after
+        // aborting the edit. Retry just the failed registrations once.
+        ...otherResumeResult.errors.map(({ id }) => id),
+      ]);
+      reportBindingErrors("resume", resumeResult.errors);
+      if (resumeResult.errors.length > 0) {
+        toast.error(
+          "Some shortcuts could not be restored. Restart Footy to restore them.",
+        );
+      }
+
+      if (recordingSessionRef.current === session) {
+        recordingSessionRef.current = null;
+        if (mountedRef.current) {
+          setEditingShortcutId(null);
+          setKeyPressed([]);
+          setRecordedKeys([]);
+        }
+      }
+    })();
+
+    return session.finalizePromise;
+  };
+
+  // Always restore a session if this component is removed while an async
+  // suspend, update, or resume operation is still in flight.
+  useEffect(() => {
+    mountedRef.current = true;
+
+    return () => {
+      mountedRef.current = false;
+      const session = recordingSessionRef.current;
+      if (session) void finishRecording(session);
+    };
+  }, []);
 
   useEffect(() => {
     // Only add event listeners when we're in editing mode
     if (editingShortcutId === null) return;
 
-    let cleanup = false;
+    const session = recordingSessionRef.current;
+    if (!session || session.id !== editingShortcutId) return;
 
     // Keyboard event listeners
-    const handleKeyDown = async (e: KeyboardEvent) => {
-      if (cleanup) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!mountedRef.current || recordingSessionRef.current !== session) {
+        return;
+      }
       if (e.repeat) return; // ignore auto-repeat
       e.preventDefault();
 
@@ -64,8 +206,10 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
       }
     };
 
-    const handleKeyUp = async (e: KeyboardEvent) => {
-      if (cleanup) return;
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (!mountedRef.current || recordingSessionRef.current !== session) {
+        return;
+      }
       e.preventDefault();
 
       // Get the key with OS-specific naming and normalize it
@@ -93,7 +237,7 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
           "win",
           "windows",
         ];
-        const sortedKeys = recordedKeys.sort((a, b) => {
+        const sortedKeys = [...recordedKeys].sort((a, b) => {
           const aIsModifier = modifiers.includes(a.toLowerCase());
           const bIsModifier = modifiers.includes(b.toLowerCase());
           if (aIsModifier && !bIsModifier) return -1;
@@ -102,57 +246,18 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
         });
         const newShortcut = sortedKeys.join("+");
 
-        if (editingShortcutId && bindings[editingShortcutId]) {
-          try {
-            await updateBinding(editingShortcutId, newShortcut);
-          } catch (error) {
-            console.error("Failed to change binding:", error);
-            toast.error(
-              t("settings.general.shortcut.errors.set", {
-                error: String(error),
-              }),
-            );
-
-            // Reset to original binding on error
-            if (originalBinding) {
-              try {
-                await updateBinding(editingShortcutId, originalBinding);
-              } catch (resetError) {
-                console.error("Failed to reset binding:", resetError);
-                toast.error(t("settings.general.shortcut.errors.reset"));
-              }
-            }
-          }
-
-          // Exit editing mode and reset states
-          setEditingShortcutId(null);
-          setKeyPressed([]);
-          setRecordedKeys([]);
-          setOriginalBinding("");
-        }
+        void finishRecording(session, newShortcut);
       }
     };
 
     // Add click outside handler
-    const handleClickOutside = async (e: MouseEvent) => {
-      if (cleanup) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (!mountedRef.current || recordingSessionRef.current !== session) {
+        return;
+      }
       const activeElement = shortcutRefs.current.get(editingShortcutId);
-      if (activeElement && !activeElement.contains(e.target as Node)) {
-        // Cancel shortcut recording and restore original binding
-        if (editingShortcutId && originalBinding) {
-          try {
-            await updateBinding(editingShortcutId, originalBinding);
-          } catch (error) {
-            console.error("Failed to restore original binding:", error);
-            toast.error(t("settings.general.shortcut.errors.restore"));
-          }
-        } else if (editingShortcutId) {
-          commands.resumeBinding(editingShortcutId).catch(console.error);
-        }
-        setEditingShortcutId(null);
-        setKeyPressed([]);
-        setRecordedKeys([]);
-        setOriginalBinding("");
+      if (!activeElement || !activeElement.contains(e.target as Node)) {
+        void finishRecording(session);
       }
     };
 
@@ -161,30 +266,41 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
     window.addEventListener("click", handleClickOutside);
 
     return () => {
-      cleanup = true;
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
       window.removeEventListener("click", handleClickOutside);
     };
-  }, [
-    keyPressed,
-    recordedKeys,
-    editingShortcutId,
-    bindings,
-    originalBinding,
-    updateBinding,
-    osType,
-  ]);
+  }, [keyPressed, recordedKeys, editingShortcutId, osType, finishRecording]);
 
   // Start recording a new shortcut
   const startRecording = async (id: string) => {
-    if (editingShortcutId === id) return; // Already editing this shortcut
+    if (recordingSessionRef.current || editingShortcutId !== null) return;
 
-    // Suspend current binding to avoid firing while recording
-    await commands.suspendBinding(id).catch(console.error);
+    const session: RecordingSession = {
+      id,
+      originalBinding: bindings[id]?.current_binding || "",
+      bindingIds: relevantBindingIds,
+      suspendPromise: Promise.resolve({
+        successfulIds: [],
+        errors: [],
+      }),
+    };
+    recordingSessionRef.current = session;
 
-    // Store the original binding to restore if canceled
-    setOriginalBinding(bindings[id]?.current_binding || "");
+    // Suspend every relevant binding so no shortcut fires (or swallows the
+    // keystrokes) while keys are being recorded.
+    session.suspendPromise = suspendBindings(session.bindingIds);
+    const suspendResult = await session.suspendPromise;
+
+    if (
+      suspendResult.errors.length > 0 ||
+      !mountedRef.current ||
+      recordingSessionRef.current !== session
+    ) {
+      void finishRecording(session);
+      return;
+    }
+
     setEditingShortcutId(id);
     setKeyPressed([]);
     setRecordedKeys([]);
