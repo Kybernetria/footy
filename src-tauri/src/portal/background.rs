@@ -69,3 +69,36 @@ pub fn notify(title: &str, body: &str) {
         }
     });
 }
+
+/// Background portal request against `tests/portal-mock/mock_portal.py`.
+/// Run with `tests/portal-mock/run.sh`.
+#[cfg(test)]
+mod mock_portal {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs mock_portal.py on a private session bus"]
+    async fn autostart_request() {
+        assert_eq!(request_autostart(true).await, Ok(true));
+        assert_eq!(request_autostart(false).await, Ok(false));
+        let conn = ashpd::zbus::Connection::session().await.unwrap();
+        let mock =
+            ashpd::zbus::Proxy::new(&conn, "org.footy.Mock", "/org/footy/Mock", "org.footy.Mock")
+                .await
+                .unwrap();
+        let (json,): (String,) = mock.call("Log", &()).await.unwrap();
+        let log: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let requests: Vec<&serde_json::Value> = log
+            .iter()
+            .filter(|e| e["event"] == "Background.RequestBackground")
+            .collect();
+        assert_eq!(requests.len(), 2);
+        let options = &requests[0]["args"][1];
+        assert_eq!(options["autostart"], true);
+        assert_eq!(options["dbus-activatable"], false);
+        assert!(options["commandline"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("footy"));
+    }
+}
