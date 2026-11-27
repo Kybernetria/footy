@@ -178,6 +178,13 @@ async fn deliver_portal(app: &AppHandle, text: String) {
             );
             return;
         }
+        Some(Ok(paste::PasteOutcome::Superseded)) => {
+            notify(
+                "Transcript saved to History",
+                "Another app changed the clipboard before Footy could paste. Open History in Footy to copy it.",
+            );
+            return;
+        }
         Some(Err(e)) => warn!("Automatic paste failed: {e}"),
         None => {}
     }

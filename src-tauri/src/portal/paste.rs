@@ -50,6 +50,7 @@ const TEXT_MIMES: [&str; 5] = [
 ];
 const RESTORE_TOKEN_KEY: &str = "portal_remote_desktop_restore_token";
 const TRANSFER_TIMEOUT: Duration = Duration::from_millis(2000);
+const COMPLETE_TIMEOUT: Duration = Duration::from_millis(10_000);
 const READ_TIMEOUT: Duration = Duration::from_millis(1000);
 const MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 const KEYBOARD: u32 = 1;
@@ -105,6 +106,17 @@ pub enum PasteOutcome {
     Pasted,
     /// The transcript is on the clipboard but no application fetched it.
     ClipboardOnly,
+    /// Another client took the clipboard before any application fetched the
+    /// transcript, so it is neither pasted nor on the clipboard.
+    Superseded,
+}
+
+/// Clipboard transfers of Footy's data: requests seen and requests whose
+/// write finished (successfully or not).
+#[derive(Clone, Copy, Default, Debug)]
+struct Transfers {
+    requested: u64,
+    finished: u64,
 }
 
 pub struct PasteSession {
@@ -113,7 +125,7 @@ pub struct PasteSession {
     session: Session<'static, RemoteDesktop<'static>>,
     path: OwnedObjectPath,
     selection: Mutex<Selection>,
-    transfers: watch::Sender<u64>,
+    transfers: watch::Sender<Transfers>,
     alive: AtomicBool,
 }
 
@@ -403,7 +415,7 @@ pub(crate) async fn start_session(
         .await;
     }
 
-    let (transfers, _) = watch::channel(0u64);
+    let (transfers, _) = watch::channel(Transfers::default());
     Ok((
         PasteSession {
             rd,
@@ -454,6 +466,9 @@ pub(crate) async fn listen(
                     continue;
                 }
                 let offer = s.selection.lock().unwrap_or_else(|e| e.into_inner()).owned.clone();
+                if offer.as_ref().is_some_and(|o| o.get(&mime).is_some()) {
+                    s.transfers.send_modify(|t| t.requested += 1);
+                }
                 let s = s.clone();
                 tauri::async_runtime::spawn(async move { serve(&s, offer, &mime, serial).await });
             }
@@ -513,9 +528,7 @@ async fn serve(s: &PasteSession, offer: Option<Offer>, mime: &str, serial: u32) 
         .clipboard
         .selection_write_done(&s.session, serial, ok)
         .await;
-    if ok {
-        s.transfers.send_modify(|n| *n += 1);
-    }
+    s.transfers.send_modify(|t| t.finished += 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -645,16 +658,44 @@ impl PasteSession {
         tokio::time::sleep(delay).await;
 
         let mut transfers = self.transfers.subscribe();
-        transfers.mark_unchanged();
+        let before = *transfers.borrow_and_update();
         self.keys(combo).await?;
 
-        let fetched = tokio::time::timeout(TRANSFER_TIMEOUT, transfers.changed())
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
-        if !fetched {
-            warn!("No application fetched the transcript after the paste keys");
-            return Ok(PasteOutcome::ClipboardOnly);
+        // The paste counts as delivered once an application requests the
+        // transcript after the keys were sent.
+        let requested = tokio::time::timeout(
+            TRANSFER_TIMEOUT,
+            transfers.wait_for(|t| t.requested > before.requested),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok());
+        if !requested {
+            let superseded = self
+                .selection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .foreign_generation
+                != generation;
+            warn!("No application fetched the transcript after the paste keys (superseded: {superseded})");
+            return Ok(if superseded {
+                PasteOutcome::Superseded
+            } else {
+                PasteOutcome::ClipboardOnly
+            });
+        }
+
+        // Wait (bounded) until every requested write has finished, so a slow
+        // reader gets the whole transcript before anything is restored.
+        let target = transfers.borrow().requested;
+        let complete = tokio::time::timeout(
+            COMPLETE_TIMEOUT,
+            transfers.wait_for(|t| t.finished >= target),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok());
+        if !complete {
+            warn!("Paste target is still reading; leaving the transcript on the clipboard");
+            return Ok(PasteOutcome::Pasted);
         }
 
         if let Some(submit) = submit {
@@ -812,9 +853,8 @@ mod tests {
     }
 }
 
-/// Protocol test against `mock_portal.py` on a private session bus (see the
-/// Flatpak test harness). Run with:
-/// `cargo test --lib portal::paste::mock_portal -- --ignored`
+/// Protocol test against `tests/portal-mock/mock_portal.py` on a private
+/// session bus. Run with `tests/portal-mock/run.sh`.
 #[cfg(test)]
 mod mock_portal {
     use super::*;
@@ -982,10 +1022,133 @@ mod mock_portal {
             "Ctrl+V pressed and released in order, then Return"
         );
 
-        // 6. Closure from the desktop ends the session.
+        // 6. Two rapid deliveries into a slow-reading target. Production
+        //    serialises them through PasteState::op (and the coordinator);
+        //    the same mutex is used here. Payloads exceed the pipe buffer so
+        //    writes block until the target reads.
+        foreign(&m, &["text/plain;charset=utf-8"], "previous clip 2").await;
+        let _: () = m.call("SetReadDelay", &(400u32,)).await.unwrap();
+        let op = Arc::new(tokio::sync::Mutex::new(()));
+        let first = format!("{}END1", "a".repeat(300_000));
+        let second = format!("{}END2", "b".repeat(300_000));
+        let run = |text: String| {
+            let (s, op) = (s.clone(), op.clone());
+            tokio::spawn(async move {
+                let _op = op.lock().await;
+                s.paste(&text, ctrl_v, delay, None, true).await
+            })
+        };
+        let (a, b) = (run(first.clone()), run(second.clone()));
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert_eq!((a, b), (Ok(PasteOutcome::Pasted), Ok(PasteOutcome::Pasted)));
+        let big: Vec<(u64, String)> = log(&m)
+            .await
+            .into_iter()
+            .filter(|e| e["event"] == "PastedText" && e["length"].is_u64())
+            .map(|e| {
+                (
+                    e["length"].as_u64().unwrap(),
+                    e["tail"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            big,
+            [
+                (first.len() as u64, "aaaaEND1".to_string()),
+                (second.len() as u64, "bbbbEND2".to_string())
+            ],
+            "both deliveries arrived complete and in order"
+        );
+        let _: () = m.call("SetReadDelay", &(0u32,)).await.unwrap();
+        assert_eq!(
+            transfer(&m, "text/plain;charset=utf-8").await,
+            (Some("previous clip 2".into()), true),
+            "the clipboard from before the first delivery is restored, not the first transcript"
+        );
+
+        // 7. Another client copies between Footy setting the selection and
+        //    the paste keys: nothing of Footy's is pasted or restored.
+        let m3 = mock().await;
+        let racer = tokio::spawn(async move {
+            for _ in 0..200 {
+                let sets = log(&m3)
+                    .await
+                    .into_iter()
+                    .filter(|e| e["event"] == "Clipboard.SetSelection")
+                    .count();
+                if sets > 0 {
+                    return sets;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            0
+        });
+        let sets_before = racer.await.unwrap();
+        let m4 = mock().await;
+        let racer = tokio::spawn(async move {
+            for _ in 0..400 {
+                let sets = log(&m4)
+                    .await
+                    .into_iter()
+                    .filter(|e| e["event"] == "Clipboard.SetSelection")
+                    .count();
+                if sets > sets_before {
+                    foreign(&m4, &["text/plain;charset=utf-8"], "copied before paste").await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = s
+            .paste("superseded", ctrl_v, Duration::from_millis(400), None, true)
+            .await;
+        racer.await.unwrap();
+        assert_eq!(outcome, Ok(PasteOutcome::Superseded));
+        assert!(
+            log(&m)
+                .await
+                .iter()
+                .any(|e| e["event"] == "PastedForeign" && e["text"] == "copied before paste"),
+            "the target pasted the other client's data"
+        );
+        assert_eq!(
+            transfer(&m, "text/plain;charset=utf-8").await,
+            (None, false),
+            "Footy neither serves nor restores after losing the selection"
+        );
+
+        // 8. Closure from the desktop ends the session.
         let _: () = m.call("CloseSession", &("rd",)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(closed.load(Ordering::SeqCst), "Closed(a{{sv}}) observed");
         assert!(!s.alive.load(Ordering::SeqCst));
+
+        // 9. Revocation then retry: a declined Start reports Denied and asks
+        //    to forget the offered token; the next consented Start works.
+        let _: () = m.call("SetStartCode", &(1u32,)).await.unwrap();
+        match start_session(Some("tok-stale")).await {
+            Ok(_) => panic!("declined start must fail"),
+            Err(f) => {
+                assert_eq!(f.state, PortalState::Denied);
+                assert!(f.token_rejected, "stale token is dropped");
+            }
+        }
+        let _: () = m.call("SetStartCode", &(0u32,)).await.unwrap();
+        let (retried, _) = match start_session(None).await {
+            Ok(started) => started,
+            Err(f) => panic!("retry failed: {}", f.message),
+        };
+        let retried = Arc::new(retried);
+        tokio::spawn(listen(retried.clone(), |_, _| {}));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let outcome = retried
+            .paste("after retry", ctrl_v, delay, None, false)
+            .await;
+        assert_eq!(outcome, Ok(PasteOutcome::Pasted));
+        assert_eq!(
+            pasted(&m).await.last().cloned(),
+            Some((Some("after retry".into()), true))
+        );
     }
 }

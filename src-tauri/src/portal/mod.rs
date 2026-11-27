@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::desktop_integration::{DesktopIntegrationStatus, PortalState};
+use crate::desktop_integration::DesktopIntegrationStatus;
 
 /// GTK display backend detected after GTK initialisation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,13 +147,6 @@ pub fn shutdown(app: &AppHandle) {
         {
             log::warn!("Timed out closing portal sessions");
         }
-    });
-}
-
-pub(crate) fn set_shortcut_state(app: &AppHandle, state: PortalState, error: Option<String>) {
-    update_status(app, |s| {
-        s.shortcuts_state = state;
-        s.shortcuts_error = error;
     });
 }
 
