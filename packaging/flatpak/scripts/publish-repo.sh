@@ -34,17 +34,11 @@ commit=$(<"$artifact/footy-commit.txt")
 work=$(mktemp -d "${RUNNER_TEMP:-$(dirname -- "$site")}/footy-publish.XXXXXXXX")
 trap 'rm -rf -- "${work:?}"' EXIT
 
-# An archive repository holds only files and directories.
-tar -tvzf "$archive" >"$work/listing"
-if grep -qv '^[-d]' "$work/listing"; then
-    die 'The artifact contains links or special files.'
-fi
 mkdir "$work/untrusted"
-tar -xzf "$archive" -C "$work/untrusted" --no-same-owner --no-same-permissions
+python3 -I "$SCRIPTS_DIR/check.py" unpack "$archive" "$work/untrusted" "$MAX_SITE_BYTES"
 source_repo="$work/untrusted/repo"
 [[ -d $source_repo/objects ]] || die 'The artifact holds no repository.'
-# Replace the artifact's configuration, which could otherwise redirect reads.
-rm -f -- "$work/untrusted/repo/config"
+# The extractor skips the artifact's configuration, which could redirect reads.
 printf '[core]\nrepo_version=1\nmode=archive-z2\n' >"$source_repo/config"
 
 ostree fsck --repo="$source_repo" --all

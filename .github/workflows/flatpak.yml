@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51@sha256:78d969b18225ae107ca29497bf09c4a3f791e5f1838a9a912a529d0024fb6210
       options: --privileged
       # Keep the image's SDKs on a writable volume, outside overlayfs.
       volumes:
@@ -100,7 +100,7 @@ jobs:
     # Holds the signing secrets; limit this environment to the main branch.
     environment: flatpak-signing
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51@sha256:78d969b18225ae107ca29497bf09c4a3f791e5f1838a9a912a529d0024fb6210
     steps:
       - name: Check out the triggering commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -112,6 +112,7 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" refs/heads/main)" = "$GITHUB_SHA"$'\trefs/heads/main'
           echo "FOOTY_ARTIFACT=$RUNNER_TEMP/footy-artifact" >>"$GITHUB_ENV"
           echo "FOOTY_SITE=$RUNNER_TEMP/footy-site" >>"$GITHUB_ENV"
 
@@ -171,6 +172,10 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Confirm that this run still builds main
+        run: |
+          test "$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" refs/heads/main)" = "$GITHUB_SHA"$'\trefs/heads/main'
+
       - name: Deploy the Pages site
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

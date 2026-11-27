@@ -30,6 +30,48 @@ mkdir -m 700 "$GNUPGHOME"
 
 step() { printf '\n== %s\n' "$*"; }
 
+step 'Validate the untrusted archive with the signing job extractor'
+python3 -I - "$scratch" <<'PY'
+import io
+import pathlib
+import sys
+import tarfile
+
+scratch = pathlib.Path(sys.argv[1])
+entries = {
+    "absolute": [tarfile.TarInfo(str(scratch / "outside"))],
+    "parent": [tarfile.TarInfo("repo/../../outside")],
+    "duplicate": [tarfile.TarInfo("repo/object"), tarfile.TarInfo("repo/object")],
+    "pax": [tarfile.TarInfo("repo/looks-safe")],
+    "symlink": [tarfile.TarInfo("repo/link")],
+    "hardlink": [tarfile.TarInfo("repo/link")],
+    "valid": [tarfile.TarInfo("repo/config"), tarfile.TarInfo("repo/object")],
+}
+entries["pax"][0].pax_headers["path"] = "repo/../../outside"
+for name, kind in [("symlink", tarfile.SYMTYPE), ("hardlink", tarfile.LNKTYPE)]:
+    entries[name][0].type = kind
+    entries[name][0].linkname = "../outside"
+for name, members in entries.items():
+    with tarfile.open(scratch / f"{name}.tar.gz", "w:gz") as archive:
+        for member in members:
+            data = b"[core]\nmode=bare\n" if member.name == "repo/config" else b""
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+PY
+mkdir "$scratch/extract"
+for variant in absolute parent duplicate pax symlink hardlink; do
+    if python3 -I "$SCRIPTS_DIR/check.py" unpack "$scratch/$variant.tar.gz" \
+        "$scratch/extract" "$MAX_SITE_BYTES" 2>"$scratch/$variant.log"; then
+        die "The extractor accepted the $variant archive."
+    fi
+    grep -Eq '^check failed: (invalid archive member path|duplicate archive member|unsupported archive member type)' \
+        "$scratch/$variant.log"
+done
+[[ ! -e $scratch/outside && ! -e $scratch/extract/repo ]]
+python3 -I "$SCRIPTS_DIR/check.py" unpack "$scratch/valid.tar.gz" \
+    "$scratch/extract" "$MAX_SITE_BYTES"
+[[ -f $scratch/extract/repo/object && ! -e $scratch/extract/repo/config ]]
+
 gpg --batch --quiet --passphrase '' \
     --quick-generate-key 'Footy repository test <test@invalid>' rsa3072 sign 1d
 FLATPAK_GPG_KEY_ID=$(gpg --batch --with-colons --list-secret-keys |

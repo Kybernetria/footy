@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Checks for the Flatpak manifest, application metadata and version numbers."""
+"""Checks for Flatpak source, application metadata, and publication input."""
 
 import configparser
 import json
 import pathlib
 import re
 import sys
+import tarfile
 import xml.etree.ElementTree as ElementTree
 
 APP_ID = "computer.footy.app"
@@ -32,6 +33,33 @@ SESSION_BUS = {"org.kde.StatusNotifierWatcher": "talk"}
 
 def fail(message):
     sys.exit(f"check failed: {message}")
+
+
+def unpack_archive(path, destination, max_bytes):
+    """Extract one archive-z2 repository into an empty, private directory."""
+    names = set()
+    members = []
+    size = 0
+    with tarfile.open(path, "r:gz") as archive:
+        for member in archive:
+            parts = member.name.split("/")
+            if parts[0] != "repo" or any(part in ("", ".", "..") for part in parts):
+                fail(f"invalid archive member path: {member.name!r}")
+            if member.name in names:
+                fail(f"duplicate archive member: {member.name!r}")
+            names.add(member.name)
+            if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE):
+                fail(f"unsupported archive member type: {member.name!r}")
+            size += member.size
+            if member.size < 0 or size > max_bytes:
+                fail("archive exceeds the extracted size limit")
+            if member.name == "repo/config":
+                if not member.isfile():
+                    fail("archive repo config is not a regular file")
+                continue
+            members.append(member)
+        # Use the same parser for validation and extraction, including PAX paths.
+        archive.extractall(destination, members=members, filter="data")
 
 
 def modules(entries):
@@ -138,5 +166,10 @@ if __name__ == "__main__":
             check_metadata(path)
         case ["version", source_dir]:
             check_version(source_dir)
+        case ["unpack", archive, destination, max_bytes]:
+            unpack_archive(archive, destination, int(max_bytes))
         case _:
-            sys.exit("usage: check.py manifest | metadata FILE | version SOURCE_DIR")
+            sys.exit(
+                "usage: check.py manifest | metadata FILE | version SOURCE_DIR "
+                "| unpack ARCHIVE DESTINATION MAX_BYTES"
+            )
