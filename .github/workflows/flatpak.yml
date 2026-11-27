@@ -62,7 +62,8 @@ jobs:
 
       - name: Continue the published history
         if: >-
-          github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+          github.repository == 'Kybernetria/footy' && github.ref == 'refs/heads/main'
+          && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
           && vars.PUBLISH_FLATPAK_REPO == 'true' && !inputs.reset_history
         run: bash packaging/flatpak/scripts/restore-history.sh "$FOOTY_WORK/repo"
 
@@ -93,7 +94,8 @@ jobs:
     name: Sign the checked build
     needs: build
     if: >-
-      github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      github.repository == 'Kybernetria/footy' && github.ref == 'refs/heads/main'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && vars.PUBLISH_FLATPAK_REPO == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -163,6 +165,7 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     needs: sign
+    if: github.repository == 'Kybernetria/footy' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

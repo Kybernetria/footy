@@ -253,7 +253,7 @@
       },
       "clipboardHandling": {
         "title": "Clipboard Handling",
-        "description": "Don't Modify Clipboard preserves your current clipboard contents after transcription. Copy to Clipboard leaves the transcription result in your clipboard after pasting.",
+        "description": "Don't Modify Clipboard tries to restore your clipboard after transcription. Copy to Clipboard leaves the transcript in your clipboard after pasting.",
         "options": {
           "dontModify": "Don't Modify Clipboard",
           "copyToClipboard": "Copy to Clipboard"
@@ -536,7 +536,7 @@
         "reconnect": "Reconnect",
         "state": {
           "off": "Off. Footy copies the transcript while its window is focused and otherwise saves it to History.",
-          "active": "On. Footy pastes into the focused app and then restores your clipboard.",
+          "active": "On. Footy can paste into the focused app. Clipboard restoration is best-effort.",
           "connecting": "Waiting for your desktop to allow access…",
           "denied": "Access was declined. Reconnect to be asked again.",
           "unsupported": "This desktop doesn't offer keyboard and clipboard access to apps.",
