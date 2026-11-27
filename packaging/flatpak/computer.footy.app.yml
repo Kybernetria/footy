@@ -1,0 +1,98 @@
+app-id: computer.footy.app
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: footy
+branch: master
+separate-locales: false
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  # Microphone capture and feedback sounds both go through PulseAudio
+  # (PipeWire's Pulse server on current desktops).
+  - --socket=pulseaudio
+  # Speech model downloads and the optional post-processing API.
+  - --share=network
+  - --device=dri
+  # Tray icon registration (StatusNotifierItem).
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Global shortcuts, automatic paste, file dialogs and autostart go through
+  # XDG desktop portals, which need no permission here.
+
+cleanup:
+  - /include
+  - /lib/cmake
+  - /lib/pkgconfig
+  - '*.a'
+  - '*.la'
+
+modules:
+  # Pinned copy of flathub/shared-modules; see shared-modules/README.md.
+  - shared-modules/libayatana-appindicator/libayatana-appindicator-gtk3.json
+
+  # Used by the recording overlay; not part of the GNOME runtime.
+  - name: gtk-layer-shell
+    buildsystem: meson
+    config-opts:
+      - -Dexamples=false
+      - -Ddocs=false
+      - -Dtests=false
+      - -Dintrospection=false
+      - -Dvapi=false
+    sources:
+      - type: git
+        url: https://github.com/wmww/gtk-layer-shell.git
+        tag: v0.10.1
+        commit: fd88ba666c18ff65ea786bf7b2e270d840030817
+
+  - name: footy
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      # bun.lock and Cargo.lock pin every dependency, and ort-sys checks the
+      # SHA-256 of the ONNX Runtime archive it downloads. This stage runs with
+      # no secrets.
+      build-args:
+        - --share=network
+      env:
+        CARGO_HOME: /run/build/footy/.cargo-home
+        CARGO_TARGET_DIR: /run/build/footy/.cargo-target
+        BUN_INSTALL_CACHE_DIR: /run/build/footy/.bun-cache
+        XDG_CACHE_HOME: /run/build/footy/.cache
+    build-commands:
+      - PATH="$PWD/.bun:$PATH" bun install --frozen-lockfile --ignore-scripts
+      - PATH="$PWD/.bun:$PATH" bun run build
+      # custom-protocol makes the binary serve the built frontend instead of
+      # connecting to the Vite development server.
+      - cargo build --manifest-path src-tauri/Cargo.toml --release --locked --features tauri/custom-protocol
+      - install -Dm755 "$CARGO_TARGET_DIR/release/footy" /app/bin/footy
+      # Tauri looks for bundled resources in ../lib/<productName>.
+      - install -d /app/lib/Footy
+      - cp -r src-tauri/resources /app/lib/Footy/resources
+      - install -Dm644 packaging/flatpak/computer.footy.app.desktop /app/share/applications/computer.footy.app.desktop
+      - install -Dm644 packaging/flatpak/computer.footy.app.metainfo.xml /app/share/metainfo/computer.footy.app.metainfo.xml
+      - install -Dm644 src-tauri/icons/32x32.png /app/share/icons/hicolor/32x32/apps/computer.footy.app.png
+      - install -Dm644 src-tauri/icons/64x64.png /app/share/icons/hicolor/64x64/apps/computer.footy.app.png
+      - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/computer.footy.app.png
+      - install -Dm644 src-tauri/icons/128x128@2x.png /app/share/icons/hicolor/256x256/apps/computer.footy.app.png
+      - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/512x512/apps/computer.footy.app.png
+      - install -Dm644 LICENSE /app/share/licenses/computer.footy.app/LICENSE
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - .flatpak-builder
+          - node_modules
+          - dist
+          - src-tauri/target
+      - type: archive
+        url: https://github.com/oven-sh/bun/releases/download/bun-v1.4.5/bun-linux-x64.zip
+        sha256: 94559b3b528995a49452f9f2404cec74f2efd7d06e0a000a8cd214b02c3666eb
+        dest: .bun
+        only-arches:
+          - x86_64
