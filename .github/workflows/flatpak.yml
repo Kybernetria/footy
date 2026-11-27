@@ -1,0 +1,176 @@
+# Builds and checks the Flatpak on pull requests. On main, and only when the
+# repository variable PUBLISH_FLATPAK_REPO is "true", also signs the checked
+# build and publishes it to GitHub Pages. See packaging/flatpak/README.md.
+name: Flatpak
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      reset_history:
+        description: Start a new repository history (after a signing key change)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Publications run one at a time and are never interrupted. Superseded pull
+  # request runs are cancelled.
+  group: flatpak-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Runs dependency build scripts with network access, so it holds no secrets
+  # and nothing it produces is trusted by the signing job without checks.
+  build:
+    name: Build and check (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+      # Keep the image's SDKs on a writable volume, outside overlayfs.
+      volumes:
+        - /var/lib/flatpak
+    env:
+      FLATPAK_REPO_URL: ${{ vars.FLATPAK_REPO_URL }}
+    steps:
+      - name: Check out the triggering commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Prepare
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p "$RUNNER_TEMP/footy-work"
+          echo "FOOTY_WORK=$RUNNER_TEMP/footy-work" >>"$GITHUB_ENV"
+          echo "FOOTY_ARTIFACT=$RUNNER_TEMP/footy-artifact" >>"$GITHUB_ENV"
+
+      - name: Check packaging sources
+        run: bash packaging/flatpak/scripts/check-source.sh
+
+      - name: Continue the published history
+        if: >-
+          github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+          && vars.PUBLISH_FLATPAK_REPO == 'true' && !inputs.reset_history
+        run: bash packaging/flatpak/scripts/restore-history.sh "$FOOTY_WORK/repo"
+
+      - name: Build the unsigned repository
+        env:
+          FLATPAK_BUILDER_ARGS: --disable-rofiles-fuse --install-deps-from=flathub
+        run: bash packaging/flatpak/scripts/build.sh "$FOOTY_WORK"
+
+      - name: Check the installed bundle
+        run: dbus-run-session -- bash packaging/flatpak/scripts/check-installed.sh "$FOOTY_WORK"
+
+      - name: Test signed publication with a temporary key
+        run: dbus-run-session -- bash packaging/flatpak/scripts/test-signed-repo.sh "$FOOTY_WORK"
+
+      - name: Pack the unsigned repository
+        run: bash packaging/flatpak/scripts/pack-artifact.sh "$FOOTY_WORK" "$FOOTY_ARTIFACT"
+
+      - name: Upload the unsigned repository
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: footy-flatpak-unsigned
+          path: ${{ env.FOOTY_ARTIFACT }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  sign:
+    name: Sign the checked build
+    needs: build
+    if: >-
+      github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      && vars.PUBLISH_FLATPAK_REPO == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Holds the signing secrets; limit this environment to the main branch.
+    environment: flatpak-signing
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+    steps:
+      - name: Check out the triggering commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Prepare
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "FOOTY_ARTIFACT=$RUNNER_TEMP/footy-artifact" >>"$GITHUB_ENV"
+          echo "FOOTY_SITE=$RUNNER_TEMP/footy-site" >>"$GITHUB_ENV"
+
+      - name: Download the unsigned repository
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: footy-flatpak-unsigned
+          path: ${{ env.FOOTY_ARTIFACT }}
+
+      - name: Import the repository signing key
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          if [[ -z $FLATPAK_GPG_PRIVATE_KEY || -z $FLATPAK_GPG_KEY_ID ]]; then
+            echo 'Set the FLATPAK_GPG_PRIVATE_KEY and FLATPAK_GPG_KEY_ID secrets.' >&2
+            exit 1
+          fi
+          GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/gnupg.XXXXXXXX")
+          export GNUPGHOME
+          echo "GNUPGHOME=$GNUPGHOME" >>"$GITHUB_ENV"
+          printf '%s\n' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          # Fail here, instead of waiting for input, if the key has a passphrase.
+          echo test | gpg --batch --pinentry-mode error \
+            --local-user "$FLATPAK_GPG_KEY_ID" --sign >/dev/null
+
+      - name: Verify, sign and assemble the site
+        env:
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          FLATPAK_REPO_URL: ${{ vars.FLATPAK_REPO_URL }}
+          FOOTY_RESET_HISTORY: ${{ inputs.reset_history || false }}
+        run: bash packaging/flatpak/scripts/publish-repo.sh "$FOOTY_ARTIFACT" "$FOOTY_SITE"
+
+      - name: Remove the signing key
+        if: always()
+        run: |
+          if [[ -n ${GNUPGHOME:-} ]]; then
+            gpgconf --kill all || true
+            rm -rf -- "${GNUPGHOME:?}"
+          fi
+
+      - name: Upload the Pages site
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: ${{ env.FOOTY_SITE }}
+          retention-days: 1
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy the Pages site
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
