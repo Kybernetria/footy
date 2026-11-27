@@ -7,6 +7,11 @@ Footy is a simple local speech-to-text desktop app.
 - Uses Silero VAD to skip silence
 - Pastes the transcript into the app you were using
 
+## Linux Flatpak
+
+See the [Flatpak guide](packaging/flatpak/README.md) for installation, updates,
+and desktop shortcut setup.
+
 ## Development
 
 Requirements: Rust and Bun.
