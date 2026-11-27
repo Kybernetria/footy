@@ -1,0 +1,13 @@
+[Flatpak Ref]
+Title=Footy
+Name=computer.footy.app
+Branch=master
+Url=@REPO_URL@/repo/
+SuggestRemoteName=footy
+Homepage=@HOMEPAGE@
+Comment=Local speech-to-text dictation
+Description=Dictate with local speech-to-text
+Icon=@REPO_URL@/icon.png
+RuntimeRepo=https://flathub.org/repo/flathub.flatpakrepo
+IsRuntime=false
+GPGKey=@GPG_KEY@

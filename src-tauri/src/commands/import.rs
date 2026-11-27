@@ -17,7 +17,6 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_clipboard_manager::ClipboardExt;
 
 /// Maximum file size for import (10 GB)
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024;
@@ -55,6 +54,14 @@ pub struct ImportProgress {
     pub stage: String,
     pub percent: u8,
     pub message: String,
+}
+
+/// Emitted when an import finishes. `copied` is false when the clipboard
+/// could not be written (for example, Footy lost focus in the Flatpak).
+#[derive(Serialize, Clone, Debug, Type)]
+pub struct TranscriptionCompleted {
+    pub text: String,
+    pub copied: bool,
 }
 
 /// Cancellation tokens for active imports
@@ -586,22 +593,38 @@ pub async fn import_audio_file(
         "Copying transcript to clipboard...",
     );
 
-    app_handle
-        .clipboard()
-        .write_text(transcription_text.clone())
-        .map_err(|e| {
-            let message = format!("Failed to copy transcript to clipboard: {}", e);
-            emit_progress(&app_handle, "failed", 0, &message);
-            message
-        })?;
+    // The transcript is already in History; a clipboard problem must not
+    // turn a successful import into a failure.
+    let copied = match crate::desktop_integration::copy_text(&app_handle, &transcription_text).await
+    {
+        Ok(crate::desktop_integration::CopyOutcome::Copied) => true,
+        Ok(crate::desktop_integration::CopyOutcome::NotFocused) => {
+            warn!("Import finished while Footy was in the background; not copied");
+            false
+        }
+        Err(e) => {
+            warn!("Failed to copy imported transcript to clipboard: {}", e);
+            false
+        }
+    };
 
-    let _ = app_handle.emit("transcription-completed", transcription_text);
+    let _ = app_handle.emit(
+        "transcription-completed",
+        TranscriptionCompleted {
+            text: transcription_text,
+            copied,
+        },
+    );
 
     emit_progress(
         &app_handle,
         "completed",
         100,
-        "Import completed and copied to clipboard",
+        if copied {
+            "Import completed and copied to clipboard"
+        } else {
+            "Import completed and saved to History"
+        },
     );
     info!("Import completed successfully ({:.1}s audio)", duration);
     Ok(())

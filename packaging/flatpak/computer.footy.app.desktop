@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Footy
+GenericName=Speech to Text
+Comment=Dictate with local speech-to-text
+Exec=footy
+Icon=computer.footy.app
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=dictation;speech;transcription;voice;microphone;
+StartupNotify=true
+StartupWMClass=footy

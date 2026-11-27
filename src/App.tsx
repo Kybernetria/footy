@@ -307,15 +307,36 @@ function App() {
 
   // Listen for completed local file transcription and show the copied text.
   useEffect(() => {
-    const unlisten = listen<string>("transcription-completed", (event) => {
-      toast.success("Transcription copied to clipboard", {
-        description: event.payload.slice(0, 240),
-      });
-    });
+    const unlisten = listen<{ text: string; copied: boolean }>(
+      "transcription-completed",
+      (event) => {
+        const { text, copied } = event.payload;
+        if (copied) {
+          toast.success(t("settings.history.importCopied"), {
+            description: text.slice(0, 240),
+          });
+          return;
+        }
+        // The clipboard could not be written in the background (Flatpak).
+        // Keep the result visible and let the user copy it while focused.
+        toast.success(t("settings.history.importReady"), {
+          description: text.slice(0, 240),
+          duration: 30000,
+          action: {
+            label: t("settings.history.copyToClipboard"),
+            onClick: () => {
+              navigator.clipboard
+                .writeText(text)
+                .catch((error) => console.error("Copy failed:", error));
+            },
+          },
+        });
+      },
+    );
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [t]);
 
   // Listen for model loading and transcription failures and show a toast.
   useEffect(() => {

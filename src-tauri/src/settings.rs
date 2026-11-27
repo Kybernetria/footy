@@ -412,6 +412,10 @@ pub struct AppSettings {
     pub ort_accelerator: OrtAcceleratorSetting,
     #[serde(default)]
     pub extra_recording_buffer_ms: u64,
+    /// Flatpak on Wayland: paste through the RemoteDesktop/Clipboard portals.
+    /// Off until the user turns it on and grants access.
+    #[serde(default)]
+    pub portal_paste_enabled: bool,
 }
 
 fn default_model() -> String {
@@ -780,6 +784,7 @@ pub fn get_default_settings() -> AppSettings {
         custom_filler_words: None,
         ort_accelerator: OrtAcceleratorSetting::default(),
         extra_recording_buffer_ms: 0,
+        portal_paste_enabled: false,
     }
 }
 

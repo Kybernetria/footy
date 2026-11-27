@@ -215,7 +215,8 @@
       },
       "autostart": {
         "label": "Launch on Startup",
-        "description": "Automatically start Footy when you log in to your computer."
+        "description": "Automatically start Footy when you log in to your computer.",
+        "unavailable": "Your desktop doesn't let sandboxed apps start at login."
       },
       "showTrayIcon": {
         "label": "Show Tray Icon",
@@ -252,7 +253,7 @@
       },
       "clipboardHandling": {
         "title": "Clipboard Handling",
-        "description": "Don't Modify Clipboard preserves your current clipboard contents after transcription. Copy to Clipboard leaves the transcription result in your clipboard after pasting.",
+        "description": "Don't Modify Clipboard tries to restore your clipboard after transcription. Copy to Clipboard leaves the transcript in your clipboard after pasting.",
         "options": {
           "dontModify": "Don't Modify Clipboard",
           "copyToClipboard": "Copy to Clipboard"
@@ -399,7 +400,9 @@
       "sourceUpload": "Uploaded File",
       "cancellingImport": "Cancelling import...",
       "importingFile": "Importing {{name}}...",
-      "importedFile": "Successfully imported {{name}}"
+      "importedFile": "Successfully imported {{name}}",
+      "importCopied": "Transcription copied to clipboard",
+      "importReady": "Transcription ready"
     },
     "debug": {
       "title": "Debug",
@@ -504,6 +507,48 @@
           "description": "Local speech-to-text powered by Parakeet ASR through ONNX Runtime with Silero voice activity detection.",
           "details": "Footy uses Parakeet for transcription, ONNX Runtime for local inference acceleration, and Silero VAD for voice activity detection. Thanks to the maintainers and contributors of these projects."
         }
+      }
+    },
+    "desktopIntegration": {
+      "title": "Desktop integration",
+      "description": "Footy runs in a Flatpak sandbox. Your desktop asks before Footy can use shortcuts or paste.",
+      "shortcuts": {
+        "title": "Global shortcuts",
+        "description": "Your desktop delivers Footy's shortcuts, including key release for push-to-talk. Choose the keys in your desktop's shortcut settings.",
+        "bindingDescription": "Set by your desktop. Use Change to pick different keys.",
+        "change": "Change",
+        "retry": "Try again",
+        "notConnected": "Not connected",
+        "unassigned": "Not assigned",
+        "state": {
+          "active": "Connected. Your desktop sends the shortcuts to Footy.",
+          "connecting": "Waiting for your desktop…",
+          "denied": "You declined the shortcut request. Try again to see it once more.",
+          "closed": "Your desktop ended the shortcut session.",
+          "unsupported": "This desktop doesn't offer global shortcuts. Use the command below instead.",
+          "failed": "Shortcuts couldn't connect: {{error}}",
+          "inactive": "Shortcuts aren't connected yet."
+        }
+      },
+      "paste": {
+        "label": "Paste automatically",
+        "description": "Lets Footy put the transcript on the clipboard and press the paste keys in the focused app. Your desktop asks once for keyboard and clipboard access. When off, Footy copies the transcript if its window is focused and otherwise saves it to History and shows a notification.",
+        "reconnect": "Reconnect",
+        "state": {
+          "off": "Off. Footy copies the transcript while its window is focused and otherwise saves it to History.",
+          "active": "On. Footy can paste into the focused app. Clipboard restoration is best-effort.",
+          "connecting": "Waiting for your desktop to allow access…",
+          "denied": "Access was declined. Reconnect to be asked again.",
+          "unsupported": "This desktop doesn't offer keyboard and clipboard access to apps.",
+          "closed": "Disconnected. Reconnect to paste automatically again.",
+          "error": "Not connected: {{error}}"
+        }
+      },
+      "cli": {
+        "title": "Shortcut command",
+        "description": "Bind this command to a key in your desktop settings to start and stop dictation. It always toggles, even with push-to-talk on.",
+        "copy": "Copy",
+        "copied": "Command copied"
       }
     }
   },

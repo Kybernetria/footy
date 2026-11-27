@@ -20,17 +20,27 @@ import { useSettings } from "../../../hooks/useSettings";
 import { KeyboardImplementationSelector } from "../debug/KeyboardImplementationSelector";
 import { AccelerationSelector } from "../AccelerationSelector";
 import { LazyStreamClose } from "../LazyStreamClose";
+import { useDesktopIntegration } from "../../../hooks/useDesktopIntegration";
 
 export const AdvancedSettings: React.FC = () => {
   const { t } = useTranslation();
   const { getSetting } = useSettings();
   const experimentalEnabled = getSetting("experimental_enabled") || false;
+  const integration = useDesktopIntegration();
+  // Host typing tools and native key grabs are unreachable from the sandbox.
+  const sandboxed = integration?.sandboxed ?? false;
+  const portalMode = integration?.portal_mode ?? false;
 
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
       <SettingsGroup title={t("settings.advanced.groups.app")}>
         <StartHidden descriptionMode="tooltip" grouped={true} />
-        <AutostartToggle descriptionMode="tooltip" grouped={true} />
+        <AutostartToggle
+          descriptionMode="tooltip"
+          grouped={true}
+          sandboxed={sandboxed}
+          supported={integration?.autostart_supported ?? true}
+        />
         <ShowTrayIcon descriptionMode="tooltip" grouped={true} />
         <ShowOverlay descriptionMode="tooltip" grouped={true} />
         <ModelUnloadTimeoutSetting descriptionMode="tooltip" grouped={true} />
@@ -39,7 +49,9 @@ export const AdvancedSettings: React.FC = () => {
 
       <SettingsGroup title={t("settings.advanced.groups.output")}>
         <PasteMethodSetting descriptionMode="tooltip" grouped={true} />
-        <TypingToolSetting descriptionMode="tooltip" grouped={true} />
+        {!sandboxed && (
+          <TypingToolSetting descriptionMode="tooltip" grouped={true} />
+        )}
         <ClipboardHandlingSetting descriptionMode="tooltip" grouped={true} />
         <AutoSubmit descriptionMode="tooltip" grouped={true} />
       </SettingsGroup>
@@ -60,10 +72,12 @@ export const AdvancedSettings: React.FC = () => {
       {experimentalEnabled && (
         <SettingsGroup title={t("settings.advanced.groups.experimental")}>
           <PostProcessingToggle descriptionMode="tooltip" grouped={true} />
-          <KeyboardImplementationSelector
-            descriptionMode="tooltip"
-            grouped={true}
-          />
+          {!portalMode && (
+            <KeyboardImplementationSelector
+              descriptionMode="tooltip"
+              grouped={true}
+            />
+          )}
           <AccelerationSelector descriptionMode="tooltip" grouped={true} />
           <LazyStreamClose descriptionMode="tooltip" grouped={true} />
         </SettingsGroup>

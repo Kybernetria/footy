@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Footy Flatpak repository</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; line-height: 1.5; max-width: 40rem; margin: 0 auto; padding: 1.5rem 1rem; }
+    pre { overflow-x: auto; padding: 0.75rem; border: 1px solid; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <img src="icon.png" alt="" width="64" height="64">
+  <h1>Footy for Flatpak</h1>
+  <p>Dictate with local speech-to-text. Builds are for x86_64 Linux.</p>
+  <h2>Install</h2>
+  <p><a href="footy.flatpakref">Install Footy</a> with KDE Discover or GNOME Software, or run:</p>
+  <pre><code>flatpak install --user --from @REPO_URL@/footy.flatpakref</code></pre>
+  <p>To add the repository first, use <a href="footy.flatpakrepo">footy.flatpakrepo</a>:</p>
+  <pre><code>flatpak remote-add --user --if-not-exists footy @REPO_URL@/footy.flatpakrepo
+flatpak install --user footy computer.footy.app</code></pre>
+  <h2>Run and update</h2>
+  <pre><code>flatpak run computer.footy.app
+flatpak update --user computer.footy.app</code></pre>
+  <h2>Shortcuts</h2>
+  <p>If your desktop cannot provide Footy's global shortcuts, bind these commands in its shortcut settings. They toggle or cancel recording in the running app.</p>
+  <pre><code>flatpak run computer.footy.app --toggle-transcription
+flatpak run computer.footy.app --toggle-post-process
+flatpak run computer.footy.app --cancel</code></pre>
+  <p><a href="@HOMEPAGE@">Source code and sandbox details</a></p>
+</body>
+</html>

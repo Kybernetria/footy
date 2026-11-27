@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>computer.footy.app</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Footy</name>
+  <summary>Dictate with local speech-to-text</summary>
+  <developer id="io.github.kybernetria">
+    <name>Footy contributors</name>
+  </developer>
+  <description>
+    <p>
+      Footy records from your microphone, transcribes the speech on your computer
+      and hands you the text. Silence is skipped, and past transcripts stay in the
+      app's history.
+    </p>
+    <p>
+      A speech model is downloaded on first use. Audio is transcribed locally.
+      Text is only sent to another service if you set up optional post-processing.
+    </p>
+    <p>
+      In the Flatpak, global shortcuts and automatic paste use your desktop's
+      permission prompts, and what is available depends on the desktop. Footy can
+      also be started and stopped with its command line options, which any desktop
+      shortcut editor can run.
+    </p>
+  </description>
+  <launchable type="desktop-id">computer.footy.app.desktop</launchable>
+  <url type="homepage">https://github.com/Kybernetria/footy</url>
+  <url type="bugtracker">https://github.com/Kybernetria/footy/issues</url>
+  <url type="vcs-browser">https://github.com/Kybernetria/footy</url>
+  <provides>
+    <binary>footy</binary>
+  </provides>
+  <categories>
+    <category>Utility</category>
+    <category>Accessibility</category>
+  </categories>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.2" date="2026-09-20"/>
+  </releases>
+</component>

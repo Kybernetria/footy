@@ -3,9 +3,13 @@ import { getVersion } from "@tauri-apps/api/app";
 
 import ModelSelector from "../model-selector";
 import UpdateChecker from "../update-checker";
+import { useDesktopIntegration } from "../../hooks/useDesktopIntegration";
 
 const Footer: React.FC = () => {
   const [version, setVersion] = useState("");
+  const integration = useDesktopIntegration();
+  // Flatpak installs are updated by Flatpak, not the built-in updater.
+  const nativeUpdates = integration?.native_updates ?? false;
 
   useEffect(() => {
     const fetchVersion = async () => {
@@ -30,8 +34,12 @@ const Footer: React.FC = () => {
 
         {/* Update Status */}
         <div className="flex items-center gap-1">
-          <UpdateChecker />
-          <span>•</span>
+          {nativeUpdates && (
+            <>
+              <UpdateChecker />
+              <span>•</span>
+            </>
+          )}
           {/* eslint-disable-next-line i18next/no-literal-string */}
           <span>v{version}</span>
         </div>

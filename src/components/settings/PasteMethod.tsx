@@ -6,6 +6,7 @@ import { Input } from "../ui/Input";
 import { useSettings } from "../../hooks/useSettings";
 import { useOsType } from "../../hooks/useOsType";
 import type { PasteMethod } from "@/bindings";
+import { useDesktopIntegration } from "../../hooks/useDesktopIntegration";
 
 interface PasteMethodProps {
   descriptionMode?: "inline" | "tooltip";
@@ -17,6 +18,10 @@ export const PasteMethodSetting: React.FC<PasteMethodProps> = React.memo(
     const { t } = useTranslation();
     const { getSetting, updateSetting, isUpdating } = useSettings();
     const osType = useOsType();
+    const integration = useDesktopIntegration();
+    // Flatpak on Wayland pastes through the portal with a key combination;
+    // direct typing and host scripts are unavailable in the sandbox.
+    const portalMode = integration?.portal_mode ?? false;
 
     const getPasteMethodOptions = (osType: string) => {
       const mod = osType === "macos" ? "Cmd" : "Ctrl";
@@ -56,6 +61,10 @@ export const PasteMethodSetting: React.FC<PasteMethodProps> = React.memo(
         );
       }
 
+      if (portalMode) {
+        return options.filter((option) => option.value !== "direct");
+      }
+
       // External script is only available on Linux
       if (osType === "linux") {
         options.push({
@@ -67,8 +76,13 @@ export const PasteMethodSetting: React.FC<PasteMethodProps> = React.memo(
       return options;
     };
 
-    const selectedMethod = (getSetting("paste_method") ||
+    const storedMethod = (getSetting("paste_method") ||
       "ctrl_v") as PasteMethod;
+    const selectedMethod: PasteMethod =
+      portalMode &&
+      (storedMethod === "direct" || storedMethod === "external_script")
+        ? "ctrl_v"
+        : storedMethod;
     const externalScriptPath = getSetting("external_script_path") || "";
 
     const pasteMethodOptions = getPasteMethodOptions(osType);

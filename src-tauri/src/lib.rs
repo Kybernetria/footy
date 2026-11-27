@@ -6,12 +6,15 @@ pub mod audio_toolkit;
 pub mod cli;
 mod clipboard;
 mod commands;
+mod desktop_integration;
 mod helpers;
 mod input;
 mod llm_client;
 mod managers;
 mod overlay;
 pub mod portable;
+#[cfg(target_os = "linux")]
+mod portal;
 mod settings;
 mod shortcut;
 mod signal_handle;
@@ -202,7 +205,16 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     // Choose the appropriate initial icon based on theme
     let initial_icon_path = tray::get_icon_path(initial_theme, tray::TrayIconState::Idle);
 
-    let tray = TrayIconBuilder::new()
+    let tray_builder = TrayIconBuilder::new();
+    // The tray host runs outside the sandbox and loads the icon from a file
+    // path, so write it under the app's cache dir (~/.var/app/<id>/cache),
+    // which the host can read, instead of the sandbox-private /tmp.
+    #[cfg(target_os = "linux")]
+    let tray_builder = match app_handle.path().app_cache_dir() {
+        Ok(cache) if portal::is_flatpak() => tray_builder.temp_dir_path(cache.join("tray-icon")),
+        _ => tray_builder,
+    };
+    let tray = tray_builder
         .icon(
             Image::from_path(
                 app_handle
@@ -221,7 +233,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
             }
             "check_updates" => {
                 let settings = settings::get_settings(app);
-                if settings.update_checks_enabled {
+                if settings.update_checks_enabled && !desktop_integration::sandboxed() {
                     show_main_window(app);
                     let _ = app.emit("check-for-updates", ());
                 }
@@ -289,16 +301,20 @@ fn initialize_core_logic(app_handle: &AppHandle) {
         tray::update_tray_menu(&app_handle_for_listener, &tray::TrayIconState::Idle, None);
     });
 
-    // Get the autostart manager and configure based on user setting
-    let autostart_manager = app_handle.autolaunch();
-    let settings = settings::get_settings(&app_handle);
+    // Get the autostart manager and configure based on user setting.
+    // Flatpak installs manage launch at login through the Background portal
+    // when the user changes the setting, never at startup.
+    if !desktop_integration::sandboxed() {
+        let autostart_manager = app_handle.autolaunch();
+        let settings = settings::get_settings(&app_handle);
 
-    if settings.autostart_enabled {
-        // Enable autostart if user has opted in
-        let _ = autostart_manager.enable();
-    } else {
-        // Disable autostart if user has opted out
-        let _ = autostart_manager.disable();
+        if settings.autostart_enabled {
+            // Enable autostart if user has opted in
+            let _ = autostart_manager.enable();
+        } else {
+            // Disable autostart if user has opted out
+            let _ = autostart_manager.disable();
+        }
     }
 
     // Create the recording overlay window (hidden by default)
@@ -424,6 +440,10 @@ pub fn run(cli_args: CliArgs) {
             commands::history::get_audio_file_data,
             commands::import::import_audio_file,
             commands::import::cancel_import,
+            desktop_integration::get_desktop_integration_status,
+            desktop_integration::retry_portal_shortcuts,
+            desktop_integration::configure_portal_shortcuts,
+            desktop_integration::set_portal_paste_enabled,
             helpers::clamshell::is_laptop,
         ])
         .events(collect_events![managers::history::HistoryUpdatePayload,]);
@@ -543,6 +563,16 @@ pub fn run(cli_args: CliArgs) {
 
             let main_window = win_builder.build()?;
 
+            // GTK is initialised now; record which display backend it chose so
+            // the Flatpak Wayland path follows GTK rather than environment guesses.
+            #[cfg(target_os = "linux")]
+            {
+                portal::detect_display_backend();
+                app.manage(portal::IntegrationState(std::sync::Mutex::new(
+                    desktop_integration::DesktopIntegrationStatus::initial(),
+                )));
+            }
+
             #[cfg(target_os = "linux")]
             {
                 let _ = main_window.set_size(tauri::Size::Logical(tauri::LogicalSize {
@@ -559,6 +589,9 @@ pub fn run(cli_args: CliArgs) {
             app.manage(TranscriptionCoordinator::new(app_handle.clone()));
 
             initialize_core_logic(&app_handle);
+
+            #[cfg(target_os = "linux")]
+            portal::init(&app_handle);
 
             // Hide tray icon if --no-tray was passed
             if cli_args.no_tray {
@@ -623,6 +656,10 @@ pub fn run(cli_args: CliArgs) {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = &event {
                 show_main_window(app);
+            }
+            #[cfg(target_os = "linux")]
+            if let tauri::RunEvent::Exit = &event {
+                portal::shutdown(app);
             }
             let _ = (app, event); // suppress unused warnings on non-macOS
         });

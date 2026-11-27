@@ -9,7 +9,6 @@ use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIcon;
 use tauri::{AppHandle, Manager, Theme};
-use tauri_plugin_clipboard_manager::ClipboardExt;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TrayIconState {
@@ -217,6 +216,11 @@ pub fn update_tray_menu(app: &AppHandle, state: &TrayIconState, locale: Option<&
         .expect("failed to create menu"),
     };
 
+    // Flatpak installs are updated by Flatpak, not the built-in updater.
+    if crate::desktop_integration::sandboxed() {
+        let _ = menu.remove(&check_updates_i);
+    }
+
     let tray = app.state::<TrayIcon>();
     let _ = tray.set_menu(Some(menu));
     let _ = tray.set_icon_as_template(true);
@@ -262,12 +266,11 @@ pub fn copy_last_transcript(app: &AppHandle) {
         return;
     }
 
-    if let Err(err) = app.clipboard().write_text(text) {
-        error!("Failed to copy last transcript to clipboard: {}", err);
-        return;
-    }
-
-    info!("Copied last transcript to clipboard via tray.");
+    let app = app.clone();
+    let text = text.to_string();
+    tauri::async_runtime::spawn(async move {
+        crate::desktop_integration::copy_from_tray(&app, text).await;
+    });
 }
 
 #[cfg(test)]

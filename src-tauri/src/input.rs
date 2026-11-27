@@ -14,6 +14,25 @@ impl EnigoState {
     }
 }
 
+/// Run `f` with the managed Enigo instance, creating it on first use.
+/// Delivery paths that never simulate input must not call this.
+pub fn with_enigo<R>(
+    app_handle: &AppHandle,
+    f: impl FnOnce(&mut Enigo) -> Result<R, String>,
+) -> Result<R, String> {
+    if app_handle.try_state::<EnigoState>().is_none() {
+        app_handle.manage(EnigoState::new()?);
+    }
+    let state = app_handle
+        .try_state::<EnigoState>()
+        .ok_or("Enigo state not initialized")?;
+    let mut enigo = state
+        .0
+        .lock()
+        .map_err(|e| format!("Failed to lock Enigo: {}", e))?;
+    f(&mut enigo)
+}
+
 /// Get the current mouse cursor position using the managed Enigo instance.
 /// Returns None if the state is not available or if getting the location fails.
 pub fn get_cursor_position(app_handle: &AppHandle) -> Option<(i32, i32)> {

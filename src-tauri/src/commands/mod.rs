@@ -135,6 +135,13 @@ pub fn check_apple_intelligence_available() -> bool {
 pub fn initialize_enigo(app: AppHandle) -> Result<(), String> {
     use crate::input::EnigoState;
 
+    // Flatpak on Wayland never simulates input through Enigo (X11 events
+    // would only reach XWayland); automatic paste uses the portal instead.
+    if crate::desktop_integration::portal_mode() {
+        log::debug!("Skipping Enigo initialization in portal mode");
+        return Ok(());
+    }
+
     // Check if already initialized
     if app.try_state::<EnigoState>().is_some() {
         log::debug!("Enigo already initialized");

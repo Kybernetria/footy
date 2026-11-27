@@ -1,0 +1,10 @@
+[Flatpak Repo]
+Title=Footy
+Url=@REPO_URL@/repo/
+Homepage=@HOMEPAGE@
+Comment=Local speech-to-text dictation
+Description=Flatpak repository for Footy
+Icon=@REPO_URL@/icon.png
+DefaultBranch=master
+DeploySideloadCollectionID=computer.footy.app.Repository
+GPGKey=@GPG_KEY@

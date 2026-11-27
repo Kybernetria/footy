@@ -11,12 +11,15 @@ import { useSettings } from "../../../hooks/useSettings";
 import { VolumeSlider } from "../VolumeSlider";
 import { MuteWhileRecording } from "../MuteWhileRecording";
 import { ModelSettingsCard } from "./ModelSettingsCard";
+import { DesktopIntegrationSettings } from "../DesktopIntegrationSettings";
+import { useDesktopIntegration } from "../../../hooks/useDesktopIntegration";
 
 export const GeneralSettings: React.FC = () => {
   const { t } = useTranslation();
   const { audioFeedbackEnabled, getSetting } = useSettings();
   const pushToTalk = getSetting("push_to_talk");
   const isLinux = type() === "linux";
+  const integration = useDesktopIntegration();
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
       <SettingsGroup title={t("settings.general.title")}>
@@ -27,6 +30,9 @@ export const GeneralSettings: React.FC = () => {
           <ShortcutInput shortcutId="cancel" grouped={true} />
         )}
       </SettingsGroup>
+      {integration?.portal_mode && (
+        <DesktopIntegrationSettings status={integration} />
+      )}
       <ModelSettingsCard />
       <SettingsGroup title={t("settings.sound.title")}>
         <MicrophoneSelector descriptionMode="tooltip" grouped={true} />
