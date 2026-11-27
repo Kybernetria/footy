@@ -3,6 +3,10 @@ use log::debug;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
+
+const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const LLM_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Serialize)]
 struct ChatMessage {
@@ -86,11 +90,34 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
 
 /// Create an HTTP client with provider-specific headers
 fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwest::Client, String> {
+    create_client_with_timeouts(provider, api_key, LLM_CONNECT_TIMEOUT, LLM_REQUEST_TIMEOUT)
+}
+
+fn create_client_with_timeouts(
+    provider: &PostProcessProvider,
+    api_key: &str,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<reqwest::Client, String> {
     let headers = build_headers(provider, api_key)?;
     reqwest::Client::builder()
         .default_headers(headers)
+        .connect_timeout(connect_timeout)
+        // This bounds both waiting for response headers and reading the body.
+        .timeout(request_timeout)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
+fn format_request_error(prefix: &str, error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        format!(
+            "{} timed out (connect/read deadline exceeded): {}",
+            prefix, error
+        )
+    } else {
+        format!("{}: {}", prefix, error)
+    }
 }
 
 /// Send a chat completion request to an OpenAI-compatible API
@@ -116,12 +143,35 @@ pub async fn send_chat_completion_with_schema(
     system_prompt: Option<String>,
     json_schema: Option<Value>,
 ) -> Result<Option<String>, String> {
+    send_chat_completion_with_schema_with_timeouts(
+        provider,
+        api_key,
+        model,
+        user_content,
+        system_prompt,
+        json_schema,
+        LLM_CONNECT_TIMEOUT,
+        LLM_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+async fn send_chat_completion_with_schema_with_timeouts(
+    provider: &PostProcessProvider,
+    api_key: String,
+    model: &str,
+    user_content: String,
+    system_prompt: Option<String>,
+    json_schema: Option<Value>,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<Option<String>, String> {
     let base_url = provider.base_url.trim_end_matches('/');
     let url = format!("{}/chat/completions", base_url);
 
     debug!("Sending chat completion request to: {}", url);
 
-    let client = create_client(provider, &api_key)?;
+    let client = create_client_with_timeouts(provider, &api_key, connect_timeout, request_timeout)?;
 
     // Build messages vector
     let mut messages = Vec::new();
@@ -161,14 +211,14 @@ pub async fn send_chat_completion_with_schema(
         .json(&request_body)
         .send()
         .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+        .map_err(|e| format_request_error("HTTP request failed", e))?;
 
     let status = response.status();
     if !status.is_success() {
         let error_text = response
             .text()
             .await
-            .unwrap_or_else(|_| "Failed to read error response".to_string());
+            .map_err(|e| format_request_error("Failed to read error response", e))?;
         return Err(format!(
             "API request failed with status {}: {}",
             status, error_text
@@ -178,7 +228,7 @@ pub async fn send_chat_completion_with_schema(
     let completion: ChatCompletionResponse = response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse API response: {}", e))?;
+        .map_err(|e| format_request_error("Failed to read or parse API response", e))?;
 
     Ok(completion
         .choices
@@ -203,14 +253,14 @@ pub async fn fetch_models(
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch models: {}", e))?;
+        .map_err(|e| format_request_error("Failed to fetch models", e))?;
 
     let status = response.status();
     if !status.is_success() {
         let error_text = response
             .text()
             .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+            .map_err(|e| format_request_error("Failed to read model list error response", e))?;
         return Err(format!(
             "Model list request failed ({}): {}",
             status, error_text
@@ -220,7 +270,7 @@ pub async fn fetch_models(
     let parsed: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+        .map_err(|e| format_request_error("Failed to read or parse model list response", e))?;
 
     let mut models = Vec::new();
 
@@ -244,4 +294,51 @@ pub async fn fetch_models(
     }
 
     Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn test_provider(base_url: String) -> PostProcessProvider {
+        PostProcessProvider {
+            id: "test".to_string(),
+            label: "Test".to_string(),
+            base_url,
+            allow_base_url_edit: true,
+            models_endpoint: None,
+            supports_structured_output: false,
+        }
+    }
+
+    #[test]
+    fn stalled_provider_returns_a_visible_timeout_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(send_chat_completion_with_schema_with_timeouts(
+            &test_provider(format!("http://{}", address)),
+            String::new(),
+            "test-model",
+            "hello".to_string(),
+            None,
+            None,
+            Duration::from_millis(100),
+            Duration::from_millis(25),
+        ));
+
+        let error = result.unwrap_err();
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+        assert!(
+            error.contains("connect/read deadline"),
+            "unexpected error: {error}"
+        );
+    }
 }

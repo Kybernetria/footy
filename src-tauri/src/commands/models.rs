@@ -51,20 +51,42 @@ pub async fn delete_model(
     transcription_manager: State<'_, Arc<TranscriptionManager>>,
     model_id: String,
 ) -> Result<(), String> {
-    // If deleting the active model, unload it and clear the setting
-    let settings = get_settings(&app_handle);
-    if settings.selected_model == model_id {
-        transcription_manager
-            .unload_model()
-            .map_err(|e| format!("Failed to unload model: {}", e))?;
-
-        let mut settings = get_settings(&app_handle);
-        settings.selected_model = String::new();
-        write_settings(&app_handle, settings);
-    }
-
+    // The lifecycle lock serializes this delete with every active-model
+    // switch. The per-model claim also rejects a concurrent download before
+    // any command-layer state or filesystem mutation occurs.
     model_manager
-        .delete_model(&model_id)
+        .with_lifecycle_operation(|| {
+            model_manager.with_model_operation(&model_id, || {
+                let original_settings = get_settings(&app_handle);
+                let was_selected = original_settings.selected_model == model_id;
+                let delete_operation = || {
+                    model_manager.delete_model_claimed_for_command(&model_id, || {
+                        if was_selected {
+                            let mut settings = get_settings(&app_handle);
+                            settings.selected_model = String::new();
+                            write_settings(&app_handle, settings);
+                        }
+                        Ok(())
+                    })
+                };
+
+                // Unload before quarantine so Windows can rename open model
+                // files. The transcription transaction restores the exact
+                // engine/current-model state if quarantine or metadata fails.
+                let result = if was_selected {
+                    transcription_manager.with_model_unloaded(delete_operation)
+                } else {
+                    delete_operation()
+                };
+                if result.is_err() && was_selected {
+                    // The model transaction normally changes settings only at
+                    // its commit point. Restore the snapshot defensively if
+                    // an invariant failure occurs after that write.
+                    write_settings(&app_handle, original_settings);
+                }
+                result
+            })
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -75,6 +97,20 @@ pub async fn delete_model(
 /// unless the unload timeout is set to "Immediately" (in which case the model
 /// will be loaded on-demand during the next transcription).
 pub fn switch_active_model(app: &AppHandle, model_id: &str) -> Result<(), String> {
+    let model_manager = app.state::<Arc<ModelManager>>();
+
+    // Use the same lifecycle owner as delete_model. This prevents a delete of
+    // the previously selected model from clearing a selection written by this
+    // switch, and prevents a switch from loading a model while deletion is
+    // quarantining its files.
+    model_manager
+        .with_lifecycle_operation(|| {
+            switch_active_model_locked(app, model_id).map_err(anyhow::Error::msg)
+        })
+        .map_err(|e| e.to_string())
+}
+
+fn switch_active_model_locked(app: &AppHandle, model_id: &str) -> Result<(), String> {
     let model_manager = app.state::<Arc<ModelManager>>();
     let transcription_manager = app.state::<Arc<TranscriptionManager>>();
 
