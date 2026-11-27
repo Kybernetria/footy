@@ -272,10 +272,13 @@ async fn run_session(app: &AppHandle, rx: &mut mpsc::UnboundedReceiver<Command>)
                 if !accepts(app, id) {
                     continue;
                 }
-                // Compositors may repeat Activated while a key is held.
-                if held.insert(id.to_string()) {
-                    handle_shortcut_event(app, id, "portal", true);
-                }
+                // Every activation reaches the handler: in toggle mode each one
+                // toggles, and some triggers never send Deactivated (KDE's
+                // kglobalaccel invokeShortcut). In push-to-talk mode the
+                // coordinator ignores presses while already recording. `held`
+                // only tracks keys to release if the session closes.
+                held.insert(id.to_string());
+                handle_shortcut_event(app, id, "portal", true);
             }
             event = deactivated.next() => {
                 let Some(event) = event else { continue };
