@@ -1,4 +1,4 @@
-use crate::input::{self, EnigoState};
+use crate::input;
 #[cfg(target_os = "linux")]
 use crate::settings::TypingTool;
 use crate::settings::{get_settings, AutoSubmitKey, ClipboardHandling, PasteMethod};
@@ -6,7 +6,7 @@ use enigo::{Direction, Enigo, Key, Keyboard};
 use log::info;
 use std::process::Command;
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 #[cfg(target_os = "linux")]
@@ -24,7 +24,6 @@ fn finish_clipboard_paste(
 
 /// Pastes text using the clipboard: saves current content, writes text, sends paste keystroke, restores clipboard.
 fn paste_via_clipboard(
-    enigo: &mut Enigo,
     text: &str,
     app_handle: &AppHandle,
     paste_method: &PasteMethod,
@@ -74,12 +73,12 @@ fn paste_via_clipboard(
 
         // Fall back to enigo if no native tool handled it
         if !key_combo_sent {
-            match paste_method {
-                PasteMethod::CtrlV => input::send_paste_ctrl_v(enigo)?,
-                PasteMethod::CtrlShiftV => input::send_paste_ctrl_shift_v(enigo)?,
-                PasteMethod::ShiftInsert => input::send_paste_shift_insert(enigo)?,
-                _ => return Err("Invalid paste method for clipboard paste".into()),
-            }
+            input::with_enigo(app_handle, |enigo| match paste_method {
+                PasteMethod::CtrlV => input::send_paste_ctrl_v(enigo),
+                PasteMethod::CtrlShiftV => input::send_paste_ctrl_shift_v(enigo),
+                PasteMethod::ShiftInsert => input::send_paste_shift_insert(enigo),
+                _ => Err("Invalid paste method for clipboard paste".into()),
+            })?;
         }
 
         Ok(())
@@ -569,7 +568,7 @@ fn paste_via_external_script(text: &str, script_path: &str) -> Result<(), String
 
 /// Types text directly by simulating individual key presses.
 fn paste_direct(
-    enigo: &mut Enigo,
+    app_handle: &AppHandle,
     text: &str,
     #[cfg(target_os = "linux")] typing_tool: TypingTool,
 ) -> Result<(), String> {
@@ -581,7 +580,7 @@ fn paste_direct(
         info!("Falling back to enigo for direct text input");
     }
 
-    input::paste_text_direct(enigo, text)
+    input::with_enigo(app_handle, |enigo| input::paste_text_direct(enigo, text))
 }
 
 fn send_return_key(enigo: &mut Enigo, key_type: AutoSubmitKey) -> Result<(), String> {
@@ -631,32 +630,29 @@ fn should_send_auto_submit(auto_submit: bool, paste_method: PasteMethod) -> bool
     auto_submit && paste_method != PasteMethod::None
 }
 
+/// Append a trailing space when the setting asks for it.
+pub fn with_trailing_space(append: bool, text: String) -> String {
+    if append {
+        format!("{} ", text)
+    } else {
+        text
+    }
+}
+
 pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
     let settings = get_settings(&app_handle);
     let paste_method = settings.paste_method;
     let paste_delay_ms = settings.paste_delay_ms;
 
-    // Append trailing space if setting is enabled
-    let text = if settings.append_trailing_space {
-        format!("{} ", text)
-    } else {
-        text
-    };
+    let text = with_trailing_space(settings.append_trailing_space, text);
 
     info!(
         "Using paste method: {:?}, delay: {}ms",
         paste_method, paste_delay_ms
     );
 
-    // Get the managed Enigo instance
-    let enigo_state = app_handle
-        .try_state::<EnigoState>()
-        .ok_or("Enigo state not initialized")?;
-    let mut enigo = enigo_state
-        .0
-        .lock()
-        .map_err(|e| format!("Failed to lock Enigo: {}", e))?;
-
+    // Enigo is acquired only by the branches that simulate input, so
+    // clipboard-only and disabled delivery work without it.
     // Perform the paste operation
     match paste_method {
         PasteMethod::None => {
@@ -664,20 +660,14 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
         }
         PasteMethod::Direct => {
             paste_direct(
-                &mut enigo,
+                &app_handle,
                 &text,
                 #[cfg(target_os = "linux")]
                 settings.typing_tool,
             )?;
         }
         PasteMethod::CtrlV | PasteMethod::CtrlShiftV | PasteMethod::ShiftInsert => {
-            paste_via_clipboard(
-                &mut enigo,
-                &text,
-                &app_handle,
-                &paste_method,
-                paste_delay_ms,
-            )?
+            paste_via_clipboard(&text, &app_handle, &paste_method, paste_delay_ms)?
         }
         PasteMethod::ExternalScript => {
             let script_path = settings
@@ -691,7 +681,9 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
 
     if should_send_auto_submit(settings.auto_submit, paste_method) {
         std::thread::sleep(Duration::from_millis(50));
-        send_return_key(&mut enigo, settings.auto_submit_key)?;
+        input::with_enigo(&app_handle, |enigo| {
+            send_return_key(enigo, settings.auto_submit_key)
+        })?;
     }
 
     // After pasting, optionally copy to clipboard based on settings
