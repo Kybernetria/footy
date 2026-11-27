@@ -211,10 +211,10 @@ async fn run_session(app: &AppHandle, rx: &mut mpsc::UnboundedReceiver<Command>)
         set_shortcut_state(app, PortalState::Failed, Some("Invalid session".into()));
         return End::Idle;
     };
-    let mut closed = match session.receive_closed().await {
+    let mut closed = match super::session_closed(&portal, &our_path).await {
         Ok(stream) => Box::pin(stream),
         Err(e) => {
-            set_shortcut_state(app, PortalState::Failed, Some(e.to_string()));
+            set_shortcut_state(app, PortalState::Failed, Some(e));
             let _ = session.close().await;
             return End::Idle;
         }

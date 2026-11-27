@@ -404,7 +404,11 @@ async fn listen(app: AppHandle, s: Arc<PasteSession>) {
     let streams = futures_util::try_join!(
         s.clipboard.receive_selection_transfer(),
         s.clipboard.receive_selection_owner_changed(),
-        s.session.receive_closed()
+        async {
+            super::session_closed(&s.rd, &s.path)
+                .await
+                .map_err(|e| ashpd::Error::Zbus(ashpd::zbus::Error::Failure(e)))
+        }
     );
     let (transfers, owners, closed) = match streams {
         Ok(streams) => streams,

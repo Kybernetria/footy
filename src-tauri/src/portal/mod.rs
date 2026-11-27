@@ -170,6 +170,29 @@ pub(crate) fn session_path<T: ashpd::desktop::SessionPortal>(
         .map(|(path, _)| path)
 }
 
+/// Stream that yields once the portal closes `path`.
+///
+/// ashpd 0.11's `Session::receive_closed` decodes `Closed` as an empty body,
+/// but portals emit `Closed(a{sv})`, so ashpd drops every real closure.
+/// Subscribe on the session object directly and treat any `Closed` as final.
+pub(crate) async fn session_closed(
+    portal: &ashpd::zbus::Proxy<'_>,
+    path: &ashpd::zvariant::OwnedObjectPath,
+) -> Result<ashpd::zbus::proxy::SignalStream<'static>, String> {
+    let session = ashpd::zbus::Proxy::new(
+        portal.connection(),
+        "org.freedesktop.portal.Desktop",
+        path.clone(),
+        "org.freedesktop.portal.Session",
+    )
+    .await
+    .map_err(|e| format!("Failed to watch the portal session: {e}"))?;
+    session
+        .receive_signal("Closed")
+        .await
+        .map_err(|e| format!("Failed to watch the portal session: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
