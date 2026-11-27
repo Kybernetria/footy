@@ -13,6 +13,8 @@ mod handler;
 pub mod handy_keys;
 mod tauri_impl;
 
+pub use handler::handle_shortcut_event;
+
 use log::{error, info, warn};
 use serde::Serialize;
 use specta::Type;
@@ -30,8 +32,24 @@ use crate::tray;
 
 // Note: Commands are accessed via shortcut::handy_keys:: in lib.rs
 
+/// Flatpak on Wayland: the compositor owns global shortcuts through the
+/// GlobalShortcuts portal. X11 grabs would only see XWayland focus, and
+/// handy-keys cannot read input devices in the sandbox.
+fn portal_shortcuts() -> bool {
+    crate::desktop_integration::portal_mode()
+}
+
+const PORTAL_REBIND_ERROR: &str =
+    "In the Flatpak, shortcuts are set in your desktop's shortcut settings.";
+
 /// Initialize shortcuts using the configured implementation
 pub fn init_shortcuts(app: &AppHandle) {
+    #[cfg(target_os = "linux")]
+    if portal_shortcuts() {
+        crate::portal::shortcuts::start(app);
+        return;
+    }
+
     let user_settings = settings::load_or_create_app_settings(app);
 
     // Check which implementation to use
@@ -58,6 +76,10 @@ pub fn init_shortcuts(app: &AppHandle) {
 
 /// Register the cancel shortcut (called when recording starts)
 pub fn register_cancel_shortcut(app: &AppHandle) {
+    // No dynamic (bare Escape) grab through the portal.
+    if portal_shortcuts() {
+        return;
+    }
     let settings = get_settings(app);
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::register_cancel_shortcut(app),
@@ -67,6 +89,9 @@ pub fn register_cancel_shortcut(app: &AppHandle) {
 
 /// Unregister the cancel shortcut (called when recording stops)
 pub fn unregister_cancel_shortcut(app: &AppHandle) {
+    if portal_shortcuts() {
+        return;
+    }
     let settings = get_settings(app);
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::unregister_cancel_shortcut(app),
@@ -76,6 +101,9 @@ pub fn unregister_cancel_shortcut(app: &AppHandle) {
 
 /// Register a shortcut using the appropriate implementation
 pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
+    if portal_shortcuts() {
+        return Err(PORTAL_REBIND_ERROR.to_string());
+    }
     let settings = get_settings(app);
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
@@ -85,6 +113,9 @@ pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<()
 
 /// Unregister a shortcut using the appropriate implementation
 pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
+    if portal_shortcuts() {
+        return Ok(());
+    }
     let settings = get_settings(app);
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
@@ -110,6 +141,14 @@ pub fn change_binding(
     id: String,
     binding: String,
 ) -> Result<BindingResponse, String> {
+    if portal_shortcuts() {
+        return Ok(BindingResponse {
+            success: false,
+            binding: None,
+            error: Some(PORTAL_REBIND_ERROR.to_string()),
+        });
+    }
+
     // Reject empty bindings — every shortcut should have a value
     if binding.trim().is_empty() {
         return Err("Binding cannot be empty".to_string());
@@ -213,6 +252,9 @@ pub fn reset_binding(app: AppHandle, id: String) -> Result<BindingResponse, Stri
 #[tauri::command]
 #[specta::specta]
 pub fn suspend_binding(app: AppHandle, id: String) -> Result<(), String> {
+    if portal_shortcuts() {
+        return Ok(());
+    }
     if let Some(b) = settings::get_bindings(&app).get(&id).cloned() {
         if let Err(e) = unregister_shortcut(&app, b) {
             error!("suspend_binding error for id '{}': {}", id, e);
@@ -226,6 +268,9 @@ pub fn suspend_binding(app: AppHandle, id: String) -> Result<(), String> {
 #[tauri::command]
 #[specta::specta]
 pub fn resume_binding(app: AppHandle, id: String) -> Result<(), String> {
+    if portal_shortcuts() {
+        return Ok(());
+    }
     if let Some(b) = settings::get_bindings(&app).get(&id).cloned() {
         if let Err(e) = register_shortcut(&app, b) {
             error!("resume_binding error for id '{}': {}", id, e);
@@ -273,6 +318,18 @@ pub fn change_keyboard_implementation_setting(
         "Switching keyboard implementation from {:?} to {:?}",
         current_impl, new_impl
     );
+
+    if portal_shortcuts() {
+        // The portal session is independent of the native implementation;
+        // keep the preference for when Footy runs outside the portal path.
+        let mut settings = settings::get_settings(&app);
+        settings.keyboard_implementation = new_impl;
+        settings::write_settings(&app, settings);
+        return Ok(ImplementationChangeResult {
+            success: true,
+            reset_bindings: vec![],
+        });
+    }
 
     // Unregister all shortcuts from the current implementation
     unregister_all_shortcuts(&app, current_impl);
@@ -596,7 +653,33 @@ pub fn change_start_hidden_setting(app: AppHandle, enabled: bool) -> Result<(), 
 
 #[tauri::command]
 #[specta::specta]
-pub fn change_autostart_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+pub async fn change_autostart_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+    // The native launcher writes a host autostart entry the sandbox cannot
+    // reach; Flatpak installs ask the Background portal instead.
+    #[cfg(target_os = "linux")]
+    if crate::portal::is_flatpak() {
+        let result = crate::portal::background::request_autostart(enabled).await;
+        let granted = match &result {
+            Ok(granted) => *granted,
+            Err(_) => false,
+        };
+        let mut settings = settings::get_settings(&app);
+        settings.autostart_enabled = granted && enabled;
+        settings::write_settings(&app, settings);
+        let _ = app.emit(
+            "settings-changed",
+            serde_json::json!({
+                "setting": "autostart_enabled",
+                "value": granted && enabled
+            }),
+        );
+        return match result {
+            Ok(granted) if granted == enabled => Ok(()),
+            Ok(_) => Err("The desktop did not allow Footy to start at login.".to_string()),
+            Err(e) => Err(e),
+        };
+    }
+
     let mut settings = settings::get_settings(&app);
     settings.autostart_enabled = enabled;
     settings::write_settings(&app, settings);
