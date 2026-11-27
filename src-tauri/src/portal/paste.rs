@@ -244,28 +244,57 @@ async fn connect(app: &AppHandle, interactive: bool) -> Result<(), String> {
     let _op = state.op.lock().await;
     set_paste_state(app, PortalState::Connecting, None);
 
-    match start_session(app, interactive).await {
-        Ok(session) => {
+    let token = load_token(app);
+    if token.is_none() && !interactive {
+        let message = "Automatic paste needs permission.".to_string();
+        set_paste_state(app, PortalState::Inactive, Some(message.clone()));
+        return Err(message);
+    }
+
+    match start_session(token.as_deref()).await {
+        Ok((session, new_token)) => {
+            // Restore tokens are single-use: always keep the new one (or none).
+            save_token(app, new_token.as_deref());
             let session = Arc::new(session);
             *state.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
-            tauri::async_runtime::spawn(listen(app.clone(), session));
+            let app_for_close = app.clone();
+            tauri::async_runtime::spawn(listen(session, move |state, message| {
+                set_paste_state(&app_for_close, state, Some(message));
+            }));
             set_paste_state(app, PortalState::Active, None);
             info!("Automatic paste session started");
             Ok(())
         }
-        Err((state, message)) => {
-            set_paste_state(app, state, Some(message.clone()));
-            Err(message)
+        Err(failure) => {
+            // A stale or revoked restore token must not be offered again.
+            if failure.token_rejected {
+                save_token(app, None);
+            }
+            set_paste_state(app, failure.state, Some(failure.message.clone()));
+            Err(failure.message)
         }
     }
 }
 
-async fn start_session(
-    app: &AppHandle,
-    interactive: bool,
-) -> Result<PasteSession, (PortalState, String)> {
-    let unsupported = |e: String| (PortalState::Unsupported, e);
-    let failed = |e: String| (PortalState::Failed, e);
+pub(crate) struct StartFailure {
+    state: PortalState,
+    message: String,
+    /// The offered restore token was not accepted and should be forgotten.
+    token_rejected: bool,
+}
+
+/// Create and start a keyboard-only RemoteDesktop session with clipboard
+/// access. Returns the session and the new restore token.
+pub(crate) async fn start_session(
+    token: Option<&str>,
+) -> Result<(PasteSession, Option<String>), StartFailure> {
+    let fail = |state: PortalState, message: String, token_rejected: bool| StartFailure {
+        state,
+        message,
+        token_rejected,
+    };
+    let unsupported = |e: String| fail(PortalState::Unsupported, e, false);
+    let failed = |e: String| fail(PortalState::Failed, e, false);
 
     let rd = RemoteDesktop::new().await.map_err(|e| {
         unsupported(format!(
@@ -295,9 +324,14 @@ async fn start_session(
     let path = session_path(&session).ok_or_else(|| failed("Invalid session".into()))?;
 
     let session_ref = &session;
+    let token_offered = token.is_some();
     let close_with = |state: PortalState, message: String| async move {
         let _ = session_ref.close().await;
-        Err::<PasteSession, _>((state, message))
+        Err::<(PasteSession, Option<String>), _>(fail(state, message, false))
+    };
+    let close_rejecting_token = |state: PortalState, message: String| async move {
+        let _ = session_ref.close().await;
+        Err::<(PasteSession, Option<String>), _>(fail(state, message, token_offered))
     };
 
     // Clipboard access has to be requested before the session starts.
@@ -309,28 +343,17 @@ async fn start_session(
         .await;
     }
 
-    let token = load_token(app);
-    if token.is_none() && !interactive {
-        return close_with(
-            PortalState::Inactive,
-            "Automatic paste needs permission.".into(),
-        )
-        .await;
-    }
     let select = rd
         .select_devices(
             &session,
             DeviceType::Keyboard.into(),
-            token.as_deref(),
+            token,
             PersistMode::ExplicitlyRevoked,
         )
         .await
         .and_then(|r| r.response());
     if let Err(e) = select {
-        if token.is_some() {
-            save_token(app, None);
-        }
-        return close_with(
+        return close_rejecting_token(
             PortalState::Failed,
             format!("Selecting the keyboard failed: {e}"),
         )
@@ -351,14 +374,10 @@ async fn start_session(
     };
 
     if response.code != RESPONSE_SUCCESS {
-        // A stale or revoked restore token must not be offered again.
-        if token.is_some() {
-            save_token(app, None);
-        }
         return if response.code == RESPONSE_CANCELLED {
-            close_with(PortalState::Denied, "Permission was declined.".into()).await
+            close_rejecting_token(PortalState::Denied, "Permission was declined.".into()).await
         } else {
-            close_with(
+            close_rejecting_token(
                 PortalState::Failed,
                 "The desktop could not start the session.".into(),
             )
@@ -366,9 +385,7 @@ async fn start_session(
         };
     }
 
-    // Restore tokens are single-use: always store the new one (or forget).
-    save_token(app, response.string("restore_token").as_deref());
-
+    let new_token = response.string("restore_token");
     let devices = response.u32("devices").unwrap_or(0);
     let clipboard_enabled = response.bool("clipboard_enabled").unwrap_or(false);
     if devices & KEYBOARD == 0 {
@@ -387,20 +404,26 @@ async fn start_session(
     }
 
     let (transfers, _) = watch::channel(0u64);
-    Ok(PasteSession {
-        rd,
-        clipboard,
-        session,
-        path,
-        selection: Mutex::new(Selection::default()),
-        transfers,
-        alive: AtomicBool::new(true),
-    })
+    Ok((
+        PasteSession {
+            rd,
+            clipboard,
+            session,
+            path,
+            selection: Mutex::new(Selection::default()),
+            transfers,
+            alive: AtomicBool::new(true),
+        },
+        new_token,
+    ))
 }
 
 /// Serve clipboard transfers and track selection ownership until the
 /// session closes.
-async fn listen(app: AppHandle, s: Arc<PasteSession>) {
+pub(crate) async fn listen(
+    s: Arc<PasteSession>,
+    on_end: impl FnOnce(PortalState, String) + Send + 'static,
+) {
     let streams = futures_util::try_join!(
         s.clipboard.receive_selection_transfer(),
         s.clipboard.receive_selection_owner_changed(),
@@ -415,7 +438,7 @@ async fn listen(app: AppHandle, s: Arc<PasteSession>) {
         Err(e) => {
             warn!("Failed to subscribe to clipboard signals: {e}");
             s.alive.store(false, Ordering::SeqCst);
-            set_paste_state(&app, PortalState::Failed, Some(e.to_string()));
+            on_end(PortalState::Failed, e.to_string());
             return;
         }
     };
@@ -455,10 +478,9 @@ async fn listen(app: AppHandle, s: Arc<PasteSession>) {
 
     if s.alive.swap(false, Ordering::SeqCst) {
         info!("Automatic paste session closed by the desktop");
-        set_paste_state(
-            &app,
+        on_end(
             PortalState::Closed,
-            Some("The desktop ended automatic paste. Reconnect to use it again.".into()),
+            "The desktop ended automatic paste. Reconnect to use it again.".into(),
         );
     }
 }
@@ -787,5 +809,183 @@ mod tests {
             submit_combo(AutoSubmitKey::CtrlEnter),
             &[keysym::CONTROL_L, keysym::RETURN]
         );
+    }
+}
+
+/// Protocol test against `mock_portal.py` on a private session bus (see the
+/// Flatpak test harness). Run with:
+/// `cargo test --lib portal::paste::mock_portal -- --ignored`
+#[cfg(test)]
+mod mock_portal {
+    use super::*;
+    use ashpd::zbus;
+
+    async fn mock() -> zbus::Proxy<'static> {
+        let conn = zbus::Connection::session().await.expect("session bus");
+        zbus::Proxy::new(&conn, "org.footy.Mock", "/org/footy/Mock", "org.footy.Mock")
+            .await
+            .expect("mock proxy")
+    }
+
+    async fn log(m: &zbus::Proxy<'_>) -> Vec<serde_json::Value> {
+        let (json,): (String,) = m.call("Log", &()).await.expect("Log");
+        serde_json::from_str(&json).expect("log json")
+    }
+
+    async fn pasted(m: &zbus::Proxy<'_>) -> Vec<(Option<String>, bool)> {
+        log(m)
+            .await
+            .into_iter()
+            .filter(|e| e["event"] == "PastedText")
+            .map(|e| (e["text"].as_str().map(str::to_string), e["ok"] == true))
+            .collect()
+    }
+
+    async fn transfer(m: &zbus::Proxy<'_>, mime: &str) -> (Option<String>, bool) {
+        let before = pasted(m).await.len();
+        let _: () = m.call("RequestTransfer", &(mime,)).await.unwrap();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let all = pasted(m).await;
+            if all.len() > before {
+                return all.last().cloned().unwrap();
+            }
+        }
+        panic!("no transfer completed for {mime}");
+    }
+
+    async fn foreign(m: &zbus::Proxy<'_>, mimes: &[&str], text: &str) {
+        let _: () = m.call("SetForeignSelection", &(mimes, text)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs mock_portal.py on a private session bus"]
+    async fn paste_flow() {
+        let m = mock().await;
+        let (session, token) = match start_session(Some("seed-token")).await {
+            Ok(started) => started,
+            Err(f) => panic!("start failed: {:?} {}", f.state, f.message),
+        };
+        assert!(token.unwrap().starts_with("tok-"), "new restore token");
+        let s = Arc::new(session);
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed_flag = closed.clone();
+        tokio::spawn(listen(s.clone(), move |state, _| {
+            assert_eq!(state, PortalState::Closed);
+            closed_flag.store(true, Ordering::SeqCst);
+        }));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let ctrl_v = paste_combo(PasteMethod::CtrlV);
+        let delay = Duration::from_millis(30);
+
+        // 1. Paste restores the previous text clipboard afterwards.
+        foreign(
+            &m,
+            &["text/plain;charset=utf-8", "UTF8_STRING"],
+            "previous clip",
+        )
+        .await;
+        let outcome = s.paste("dictated ü", ctrl_v, delay, None, true).await;
+        assert_eq!(outcome, Ok(PasteOutcome::Pasted));
+        assert_eq!(
+            pasted(&m).await.last().cloned(),
+            Some((Some("dictated ü".into()), true)),
+            "the target app received the transcript through the fd"
+        );
+        assert_eq!(
+            transfer(&m, "UTF8_STRING").await,
+            (Some("previous clip".into()), true),
+            "previous clipboard restored and served"
+        );
+
+        // 2. CopyToClipboard mode (restore = false) leaves the transcript.
+        let outcome = s.paste("second", ctrl_v, delay, None, false).await;
+        assert_eq!(outcome, Ok(PasteOutcome::Pasted));
+        assert_eq!(
+            transfer(&m, "text/plain;charset=utf-8").await,
+            (Some("second".into()), true)
+        );
+
+        // 3. If the user copies something while Footy pastes, Footy does not
+        //    overwrite it during restoration.
+        foreign(&m, &["text/plain;charset=utf-8"], "older").await;
+        let m2 = mock().await;
+        let racer = tokio::spawn(async move {
+            for _ in 0..100 {
+                if pasted(&m2)
+                    .await
+                    .last()
+                    .and_then(|p| p.0.clone())
+                    .as_deref()
+                    == Some("third")
+                {
+                    foreign(&m2, &["text/plain;charset=utf-8"], "user copied meanwhile").await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let outcome = s.paste("third", ctrl_v, delay, None, true).await;
+        racer.await.unwrap();
+        assert_eq!(outcome, Ok(PasteOutcome::Pasted));
+        assert_eq!(
+            transfer(&m, "text/plain;charset=utf-8").await,
+            (None, false),
+            "Footy no longer serves anything after another client took the selection"
+        );
+
+        // 4. No app fetches the data (the mock only reacts to Ctrl+V):
+        //    the transcript stays on the clipboard and is reported as such.
+        let outcome = s
+            .paste(
+                "unclaimed",
+                paste_combo(PasteMethod::ShiftInsert),
+                delay,
+                None,
+                true,
+            )
+            .await;
+        assert_eq!(outcome, Ok(PasteOutcome::ClipboardOnly));
+        assert_eq!(
+            transfer(&m, "text/plain").await,
+            (Some("unclaimed".into()), true)
+        );
+
+        // 5. Auto-submit sends Return after the transfer.
+        let outcome = s
+            .paste(
+                "submit me",
+                ctrl_v,
+                delay,
+                Some(submit_combo(AutoSubmitKey::Enter)),
+                false,
+            )
+            .await;
+        assert_eq!(outcome, Ok(PasteOutcome::Pasted));
+        let keys: Vec<String> = log(&m)
+            .await
+            .into_iter()
+            .filter(|e| e["event"] == "RemoteDesktop.NotifyKeyboardKeysym")
+            .map(|e| format!("{}:{}", e["keysym"].as_str().unwrap(), e["state"]))
+            .collect();
+        let tail: Vec<&str> = keys
+            .iter()
+            .rev()
+            .take(6)
+            .rev()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            tail,
+            ["0xffe3:1", "0x76:1", "0x76:0", "0xffe3:0", "0xff0d:1", "0xff0d:0"],
+            "Ctrl+V pressed and released in order, then Return"
+        );
+
+        // 6. Closure from the desktop ends the session.
+        let _: () = m.call("CloseSession", &("rd",)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(closed.load(Ordering::SeqCst), "Closed(a{{sv}}) observed");
+        assert!(!s.alive.load(Ordering::SeqCst));
     }
 }
